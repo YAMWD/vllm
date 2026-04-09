@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -155,6 +157,10 @@ class Scheduler(SchedulerInterface):
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
+        # Spec-decode per-token acceptance tracing (opt-in via env var).
+        self._spec_decode_trace_file = os.environ.get(
+            "VLLM_SPEC_DECODE_TRACE_FILE")
+        self._spec_decode_trace: dict[str, list[bool]] = {}
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -1382,6 +1388,17 @@ class Scheduler(SchedulerInterface):
                     request_id=req_id,
                 )
 
+            # Per-token acceptance tracing for raster plots.
+            if self._spec_decode_trace_file is not None:
+                trace = self._spec_decode_trace.setdefault(req_id, [])
+                if scheduled_spec_token_ids and generated_token_ids:
+                    trace.extend([True] * num_accepted)
+                    # Last token: False if rejection, True if bonus
+                    trace.append(num_accepted >= num_draft_tokens)
+                elif generated_token_ids:
+                    # Non-speculative step (e.g. prefill): target-only
+                    trace.extend([True] * len(generated_token_ids))
+
             stopped = False
             new_logprobs = None
             new_token_ids = generated_token_ids
@@ -1812,6 +1829,18 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> dict[str, Any] | None:
         assert request.is_finished()
+
+        # Write per-token acceptance trace for this request.
+        if self._spec_decode_trace_file is not None:
+            mask = self._spec_decode_trace.pop(request.request_id, None)
+            if mask is not None:
+                entry = {"request_id": request.request_id,
+                         "acceptance": mask}
+                try:
+                    with open(self._spec_decode_trace_file, "a") as f:
+                        f.write(json.dumps(entry) + "\n")
+                except OSError:
+                    pass
 
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
