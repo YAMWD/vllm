@@ -497,7 +497,12 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash"):
+                # If method is explicitly set to "draft_model", respect it
+                # and skip auto-detection (e.g. user wants a separate small
+                # draft model even if the architecture supports MTP).
+                if self.method == "draft_model":
+                    pass
+                elif self.method in ("eagle", "eagle3", "dflash"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B

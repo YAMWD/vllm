@@ -160,7 +160,15 @@ class Scheduler(SchedulerInterface):
         # Spec-decode per-token acceptance tracing (opt-in via env var).
         self._spec_decode_trace_file = os.environ.get(
             "VLLM_SPEC_DECODE_TRACE_FILE")
+        # req_id -> acceptance mask (list[bool])
         self._spec_decode_trace: dict[str, list[bool]] = {}
+        # req_id -> per-output-token target top-K logprobs
+        #   list[ {token_id: logprob} ]  (None entries for non-spec prefill)
+        self._spec_decode_target_lp: dict[
+            str, list[dict[int, float] | None]] = {}
+        # req_id -> per-output-token draft top-K logprobs (None = no draft)
+        self._spec_decode_draft_lp: dict[
+            str, list[dict[int, float] | None]] = {}
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -1388,16 +1396,70 @@ class Scheduler(SchedulerInterface):
                     request_id=req_id,
                 )
 
-            # Per-token acceptance tracing for raster plots.
+            # Per-token acceptance tracing for raster plots / analysis.
             if self._spec_decode_trace_file is not None:
                 trace = self._spec_decode_trace.setdefault(req_id, [])
+                t_lp_list = self._spec_decode_target_lp.setdefault(
+                    req_id, [])
+                d_lp_list = self._spec_decode_draft_lp.setdefault(
+                    req_id, [])
+
                 if scheduled_spec_token_ids and generated_token_ids:
+                    # ── Speculative step ──────────────────────────────────
                     trace.extend([True] * num_accepted)
-                    # Last token: False if rejection, True if bonus
                     trace.append(num_accepted >= num_draft_tokens)
+
+                    # Target logprobs: one per output token (accepted + bonus)
+                    if logprobs is not None:
+                        sliced = logprobs.slice_request(
+                            req_index, len(generated_token_ids))
+                        for pos in range(len(generated_token_ids)):
+                            d: dict[int, float] = {
+                                int(sliced.logprob_token_ids[pos, j]):
+                                float(sliced.logprobs[pos, j])
+                                for j in range(
+                                    sliced.logprob_token_ids.shape[1])
+                            }
+                            t_lp_list.append(d)
+                    else:
+                        t_lp_list.extend([None] * len(generated_token_ids))
+
+                    # Draft logprobs: accepted positions + correction/bonus.
+                    # all_draft_lp[i] is the draft's distribution at step i.
+                    # For the correction token (first rejected position), use
+                    # all_draft_lp[num_accepted] so KL can be computed there
+                    # too — this is where draft vs target diverges most.
+                    from vllm.v1.spec_decode import trace_state
+                    all_draft_lp = trace_state.pop_draft_logprobs(req_id)
+                    for i in range(num_accepted):
+                        d_lp_list.append(
+                            all_draft_lp[i] if i < len(all_draft_lp) else None
+                        )
+                    # Bonus/correction token: use draft's logprob at that step
+                    # if available (i.e. the draft proposed something there).
+                    correction_lp = (
+                        all_draft_lp[num_accepted]
+                        if num_accepted < len(all_draft_lp) else None
+                    )
+                    d_lp_list.append(correction_lp)
+
                 elif generated_token_ids:
-                    # Non-speculative step (e.g. prefill): target-only
+                    # ── Non-speculative step (prefill / AR decode) ────────
                     trace.extend([True] * len(generated_token_ids))
+                    if logprobs is not None:
+                        sliced = logprobs.slice_request(
+                            req_index, len(generated_token_ids))
+                        for pos in range(len(generated_token_ids)):
+                            d = {
+                                int(sliced.logprob_token_ids[pos, j]):
+                                float(sliced.logprobs[pos, j])
+                                for j in range(
+                                    sliced.logprob_token_ids.shape[1])
+                            }
+                            t_lp_list.append(d)
+                    else:
+                        t_lp_list.extend([None] * len(generated_token_ids))
+                    d_lp_list.extend([None] * len(generated_token_ids))
 
             stopped = False
             new_logprobs = None
@@ -1830,17 +1892,27 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         assert request.is_finished()
 
-        # Write per-token acceptance trace for this request.
+        # Write per-token acceptance + logprobs trace for this request.
         if self._spec_decode_trace_file is not None:
-            mask = self._spec_decode_trace.pop(request.request_id, None)
+            req_id = request.request_id
+            mask = self._spec_decode_trace.pop(req_id, None)
             if mask is not None:
-                entry = {"request_id": request.request_id,
-                         "acceptance": mask}
+                entry: dict = {
+                    "request_id": req_id,
+                    "acceptance": mask,
+                    "target_logprobs": self._spec_decode_target_lp.pop(
+                        req_id, None),
+                    "draft_logprobs": self._spec_decode_draft_lp.pop(
+                        req_id, None),
+                }
                 try:
                     with open(self._spec_decode_trace_file, "a") as f:
                         f.write(json.dumps(entry) + "\n")
                 except OSError:
                     pass
+            # Clean up even if mask was None
+            self._spec_decode_target_lp.pop(req_id, None)
+            self._spec_decode_draft_lp.pop(req_id, None)
 
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)

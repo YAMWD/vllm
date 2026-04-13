@@ -4716,6 +4716,27 @@ class GPUModelRunner(
                 slot_mappings=slot_mappings,
             )
 
+            # Write per-step draft logprobs to the trace-state side-channel
+            # when VLLM_SPEC_DECODE_TRACE_FILE is set.
+            if hasattr(self.drafter, "pop_draft_lp_buf"):
+                lp_steps = self.drafter.pop_draft_lp_buf()
+                if lp_steps:
+                    from vllm.v1.spec_decode import trace_state
+                    num_reqs = self.input_batch.num_reqs
+                    req_ids = self.input_batch.req_ids
+                    # lp_steps: k entries of (indices[batch,K], values[batch,K])
+                    # Transpose to per-request: deposit one dict per draft step.
+                    for step_indices, step_values in lp_steps:
+                        for req_idx in range(
+                                min(num_reqs, step_indices.shape[0])):
+                            req_id = req_ids[req_idx]
+                            d = {
+                                int(step_indices[req_idx, j]):
+                                float(step_values[req_idx, j])
+                                for j in range(step_indices.shape[1])
+                            }
+                            trace_state.add_draft_logprobs(req_id, d)
+
         return draft_token_ids
 
     def update_config(self, overrides: dict[str, Any]) -> None:

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
+import os
 from importlib.util import find_spec
 from typing import Any, cast
 
@@ -107,6 +108,14 @@ class SpecDecodeBaseProposer:
         self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.token_arange_np = np.arange(self.max_num_tokens)
+
+        # Per-step draft logprobs buffer (opt-in via VLLM_SPEC_DECODE_TRACE_FILE).
+        # Populated by _greedy_sample(); read and cleared by gpu_model_runner
+        # after each propose() call.
+        self._trace_draft_logprobs: bool = bool(
+            os.environ.get("VLLM_SPEC_DECODE_TRACE_FILE"))
+        # list of (indices_cpu[batch,K], values_cpu[batch,K]) per draft step
+        self._draft_lp_buf: list[tuple[torch.Tensor, torch.Tensor]] = []
 
         # Can be specialized by methods like DFlash to reduce the limit
         self.max_query_tokens = self.max_num_tokens
@@ -394,8 +403,23 @@ class SpecDecodeBaseProposer:
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
         if self.use_local_argmax_reduction:
-            return self.model.get_top_tokens(hidden_states)
-        return self.model.compute_logits(hidden_states).argmax(dim=-1)
+            token_ids = self.model.get_top_tokens(hidden_states)
+            # No full logits available in this path — skip draft logprob trace.
+            return token_ids
+        logits = self.model.compute_logits(hidden_states)
+        if self._trace_draft_logprobs:
+            top = torch.topk(
+                torch.log_softmax(logits.float(), dim=-1), k=20)
+            self._draft_lp_buf.append(
+                (top.indices.cpu(), top.values.cpu()))
+        return logits.argmax(dim=-1)
+
+    def pop_draft_lp_buf(
+        self,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Return and clear the accumulated per-step draft logprob buffer."""
+        result, self._draft_lp_buf = self._draft_lp_buf, []
+        return result
 
     def propose(
         self,
