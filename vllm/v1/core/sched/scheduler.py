@@ -2137,8 +2137,10 @@ class Scheduler(SchedulerInterface):
                     speculative_config.num_speculative_tokens
                     if speculative_config else None)
                 temperature = None
+                top_p = None
                 if request.sampling_params is not None:
                     temperature = request.sampling_params.temperature
+                    top_p = request.sampling_params.top_p
 
                 entry: dict = {
                     "request_id": req_id,
@@ -2163,6 +2165,7 @@ class Scheduler(SchedulerInterface):
                 entry.update({
                     "gamma": gamma,
                     "temperature": temperature,
+                    "top_p": top_p,
                     "prompt_token_count": request.num_prompt_tokens,
                     "generated_token_count": len(records) if records
                                              else len(mask),
