@@ -3335,6 +3335,18 @@ class GPUModelRunner(
             logits,
             sampling_metadata,
         )
+
+        # Deposit target-side trace data when tracing is enabled.
+        target_trace = self.rejection_sampler.pop_target_trace_buf()
+        if target_trace:
+            from vllm.v1.spec_decode import trace_state
+            num_reqs = self.input_batch.num_reqs
+            req_ids = self.input_batch.req_ids
+            for req_idx in range(min(num_reqs, len(target_trace))):
+                req_id = req_ids[req_idx]
+                for pos_data in target_trace[req_idx]:
+                    trace_state.add_target_trace(req_id, pos_data)
+
         return sampler_output
 
     def _bookkeeping_sync(
@@ -4736,6 +4748,38 @@ class GPUModelRunner(
                                 for j in range(step_indices.shape[1])
                             }
                             trace_state.add_draft_logprobs(req_id, d)
+
+                # Deposit extended draft trace data (entropy, raw logits, etc.)
+                trace_steps = self.drafter.pop_draft_trace_buf()
+                if trace_steps:
+                    from vllm.v1.spec_decode import trace_state as ts
+                    num_reqs = self.input_batch.num_reqs
+                    req_ids = self.input_batch.req_ids
+                    for step_data in trace_steps:
+                        batch_sz = step_data["entropy"].shape[0]
+                        for req_idx in range(min(num_reqs, batch_sz)):
+                            req_id = req_ids[req_idx]
+                            rec = {
+                                "logits_top10_ids":
+                                    step_data["logits_top10_ids"][
+                                        req_idx].tolist(),
+                                "logits_top10_vals":
+                                    step_data["logits_top10_vals"][
+                                        req_idx].tolist(),
+                                "softmax_top10_ids":
+                                    step_data["softmax_top10_ids"][
+                                        req_idx].tolist(),
+                                "softmax_top10_vals":
+                                    step_data["softmax_top10_vals"][
+                                        req_idx].tolist(),
+                                "entropy":
+                                    float(step_data["entropy"][req_idx]),
+                                "top1_prob":
+                                    float(step_data["top1_prob"][req_idx]),
+                                "top5_prob":
+                                    float(step_data["top5_prob"][req_idx]),
+                            }
+                            ts.add_draft_trace(req_id, rec)
 
         return draft_token_ids
 
