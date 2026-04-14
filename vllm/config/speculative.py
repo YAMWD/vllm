@@ -847,13 +847,28 @@ class SpeculativeConfig:
             target_vocab_size = self.target_model_config.get_vocab_size()
             draft_vocab_size = self.draft_model_config.get_vocab_size()
             if target_vocab_size != draft_vocab_size:
-                raise ValueError(
-                    f"Target and draft model should have the same vocabulary size. "
-                    f"Target model vocab_size={target_vocab_size}. "
-                    f"Draft model vocab_size={draft_vocab_size}. "
-                    f"Using models with different tokenizers can cause out-of-bounds "
-                    f"errors during speculative decoding."
-                )
+                # Allow the case where draft vocab is smaller than target
+                # vocab due to TP-alignment padding (e.g. Qwen2.5 family:
+                # 0.5B has 151936, 7B has 152064 — same tokenizer, different
+                # padding). Draft logits are padded with -inf at runtime.
+                if draft_vocab_size < target_vocab_size:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(
+                        "Draft model vocab_size=%d < target model "
+                        "vocab_size=%d. Assuming TP-alignment padding; "
+                        "draft logits will be padded with -inf at runtime.",
+                        draft_vocab_size, target_vocab_size,
+                    )
+                else:
+                    raise ValueError(
+                        f"Target and draft model should have the same "
+                        f"vocabulary size. Target model "
+                        f"vocab_size={target_vocab_size}. Draft model "
+                        f"vocab_size={draft_vocab_size}. Using models with "
+                        f"different tokenizers can cause out-of-bounds "
+                        f"errors during speculative decoding."
+                    )
 
     @property
     def max_num_new_slots_for_drafting(self) -> int:
