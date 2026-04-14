@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Sequence
 from dataclasses import replace
 
@@ -19,6 +20,9 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 logger = init_logger(__name__)
+
+# Module-level flag: read once at import time for zero overhead when unset.
+_TRACE_ENABLED: bool = bool(os.environ.get("VLLM_SPEC_DECODE_TRACE_FILE"))
 
 PLACEHOLDER_TOKEN_ID: tl.constexpr = -1
 GREEDY_TEMPERATURE: tl.constexpr = 0
@@ -56,6 +60,9 @@ class RejectionSampler(nn.Module):
         logprobs_mode = self.sampler.logprobs_mode
         self.is_processed_logprobs_mode = logprobs_mode.startswith("processed")
         self.is_logits_logprobs_mode = logprobs_mode.endswith("logits")
+        # Per-forward target trace buffer, populated when _TRACE_ENABLED.
+        # List of per-request dicts with target-side statistics.
+        self._target_trace_buf: list[list[dict]] = []
 
     def forward(
         self,
@@ -149,6 +156,12 @@ class RejectionSampler(nn.Module):
             sampling_metadata,
         )
 
+        # Extract target-side trace data when tracing is enabled.
+        # This is gated behind _TRACE_ENABLED for zero overhead when unset.
+        if _TRACE_ENABLED:
+            self._extract_target_trace(
+                metadata, target_logits, draft_probs)
+
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
             logprobs_tensors = self._get_logprobs_tensors(
@@ -213,6 +226,77 @@ class RejectionSampler(nn.Module):
             max_num_logprobs,
             accepted_tokens.to(torch.int64),
         )
+
+    def _extract_target_trace(
+        self,
+        metadata: SpecDecodeMetadata,
+        target_logits: torch.Tensor,
+        draft_probs: torch.Tensor | None,
+    ) -> None:
+        """Extract per-position target-side trace data for speculative
+        decoding analysis. Called only when _TRACE_ENABLED is True.
+
+        For each draft token position per request, computes:
+        - target_prob_of_draft_token: target softmax probability at the
+          draft-chosen token
+        - target_top1_token_id / target_top1_prob: target model's argmax
+        - kl_divergence: KL(draft || target) top-k approximation
+
+        Results are stored in self._target_trace_buf as a list (per request)
+        of lists (per position) of dicts.
+        """
+        batch_size = len(metadata.num_draft_tokens)
+        draft_token_ids = metadata.draft_token_ids
+        cu = metadata.cu_num_draft_tokens
+
+        # Compute target softmax once over all draft positions.
+        target_probs = torch.softmax(target_logits.float(), dim=-1)
+        target_top1 = target_probs.max(dim=-1)  # values, indices
+
+        per_request_results: list[list[dict]] = []
+        offset = 0
+        for req_idx in range(batch_size):
+            n = metadata.num_draft_tokens[req_idx]
+            req_results: list[dict] = []
+            for pos in range(n):
+                tidx = offset + pos
+                draft_tok = int(draft_token_ids[tidx].item())
+                t_prob_at_draft = float(target_probs[tidx, draft_tok].item())
+                t_top1_id = int(target_top1.indices[tidx].item())
+                t_top1_p = float(target_top1.values[tidx].item())
+
+                # KL(draft || target) approximation using top-k.
+                # When draft_probs is None (ngram spec decode), skip KL.
+                kl = 0.0
+                if draft_probs is not None:
+                    # Use top-20 of draft distribution for the approximation.
+                    d_probs_row = draft_probs[tidx]
+                    t_probs_row = target_probs[tidx]
+                    d_top20 = torch.topk(d_probs_row, k=min(20,
+                                         d_probs_row.shape[0]))
+                    d_vals = d_top20.values.float()
+                    t_vals = t_probs_row[d_top20.indices].float()
+                    eps = 1e-12
+                    # KL = sum p_d * log(p_d / p_t) over shared top-k
+                    mask = (d_vals > eps) & (t_vals > eps)
+                    if mask.any():
+                        kl = float((d_vals[mask] * torch.log(
+                            d_vals[mask] / t_vals[mask])).sum().item())
+
+                req_results.append({
+                    "target_prob_of_draft_token": t_prob_at_draft,
+                    "target_top1_token_id": t_top1_id,
+                    "target_top1_prob": t_top1_p,
+                    "kl_divergence": kl,
+                })
+            offset += n
+            per_request_results.append(req_results)
+        self._target_trace_buf = per_request_results
+
+    def pop_target_trace_buf(self) -> list[list[dict]]:
+        """Return and clear the per-forward target trace buffer."""
+        result, self._target_trace_buf = self._target_trace_buf, []
+        return result
 
     @staticmethod
     def parse_output(
