@@ -116,6 +116,10 @@ class SpecDecodeBaseProposer:
             os.environ.get("VLLM_SPEC_DECODE_TRACE_FILE"))
         # list of (indices_cpu[batch,K], values_cpu[batch,K]) per draft step
         self._draft_lp_buf: list[tuple[torch.Tensor, torch.Tensor]] = []
+        # Extended draft trace buffer: list of dicts per draft step.
+        # Each dict holds per-batch-row trace tensors (all CPU).
+        # Only populated when _trace_draft_logprobs is True.
+        self._draft_trace_buf: list[dict[str, torch.Tensor]] = []
 
         # Can be specialized by methods like DFlash to reduce the limit
         self.max_query_tokens = self.max_num_tokens
@@ -408,10 +412,33 @@ class SpecDecodeBaseProposer:
             return token_ids
         logits = self.model.compute_logits(hidden_states)
         if self._trace_draft_logprobs:
-            top = torch.topk(
-                torch.log_softmax(logits.float(), dim=-1), k=20)
+            logits_f = logits.float()
+            # Existing: top-20 log-softmax for backward compat
+            log_sm = torch.log_softmax(logits_f, dim=-1)
+            top = torch.topk(log_sm, k=20)
             self._draft_lp_buf.append(
                 (top.indices.cpu(), top.values.cpu()))
+
+            # Extended trace: raw logits top-10, softmax top-10, entropy,
+            # top-1 prob, top-5 prob.
+            raw_top10 = torch.topk(logits_f, k=10)
+            probs = torch.softmax(logits_f, dim=-1)
+            sm_top10 = torch.topk(probs, k=10)
+            # Shannon entropy in bits: H = -sum(p * log2(p + eps))
+            eps = 1e-12
+            entropy = -(probs * torch.log2(probs + eps)).sum(dim=-1)
+            top1_prob = probs.max(dim=-1).values
+            top5_prob = torch.topk(probs, k=5, dim=-1).values.sum(dim=-1)
+
+            self._draft_trace_buf.append({
+                "logits_top10_ids": raw_top10.indices.cpu(),
+                "logits_top10_vals": raw_top10.values.cpu(),
+                "softmax_top10_ids": sm_top10.indices.cpu(),
+                "softmax_top10_vals": sm_top10.values.cpu(),
+                "entropy": entropy.cpu(),
+                "top1_prob": top1_prob.cpu(),
+                "top5_prob": top5_prob.cpu(),
+            })
         return logits.argmax(dim=-1)
 
     def pop_draft_lp_buf(
@@ -419,6 +446,13 @@ class SpecDecodeBaseProposer:
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Return and clear the accumulated per-step draft logprob buffer."""
         result, self._draft_lp_buf = self._draft_lp_buf, []
+        return result
+
+    def pop_draft_trace_buf(
+        self,
+    ) -> list[dict[str, "torch.Tensor"]]:
+        """Return and clear the accumulated per-step draft trace buffer."""
+        result, self._draft_trace_buf = self._draft_trace_buf, []
         return result
 
     def propose(
