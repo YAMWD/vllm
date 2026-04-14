@@ -266,8 +266,11 @@ class RejectionSampler(nn.Module):
                 t_top1_p = float(target_top1.values[tidx].item())
 
                 # KL(draft || target) approximation using top-k.
-                # When draft_probs is None (ngram spec decode), skip KL.
-                kl = 0.0
+                # When draft_probs is None (e.g., EAGLE with greedy
+                # decoding), KL cannot be computed here. Set to None
+                # and let the scheduler compute it from draft softmax
+                # data in trace_state if available.
+                kl: float | None = None
                 if draft_probs is not None:
                     # Use top-20 of draft distribution for the approximation.
                     d_probs_row = draft_probs[tidx]

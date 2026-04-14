@@ -359,6 +359,44 @@ class Scheduler(SchedulerInterface):
                     cfg[key] = val
         return cfg
 
+    @staticmethod
+    def _approx_kl_from_topk(
+        draft_softmax_top10: list[dict],
+        sliced_logprobs,
+        pos: int,
+    ) -> float | None:
+        """Approximate KL(draft || target) using draft softmax top-10
+        and target logprobs from the model output.
+
+        For each draft top-10 token, look up its target logprob. If
+        found, compute the KL contribution. This is a rough top-k
+        approximation.
+        """
+        import math
+        # Build target logprob lookup: token_id -> logprob
+        target_lp: dict[int, float] = {}
+        for j in range(sliced_logprobs.logprob_token_ids.shape[1]):
+            tid = int(sliced_logprobs.logprob_token_ids[pos, j])
+            lp = float(sliced_logprobs.logprobs[pos, j])
+            target_lp[tid] = lp
+
+        kl = 0.0
+        n_shared = 0
+        for entry in draft_softmax_top10:
+            tid = entry["id"]
+            p_d = entry["prob"]
+            if p_d <= 1e-12:
+                continue
+            t_lp = target_lp.get(tid)
+            if t_lp is None:
+                continue
+            p_t = math.exp(t_lp)
+            if p_t <= 1e-12:
+                continue
+            kl += p_d * math.log(p_d / p_t)
+            n_shared += 1
+        return kl if n_shared > 0 else None
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -1563,8 +1601,21 @@ class Scheduler(SchedulerInterface):
                                 "target_top1_token_id"]
                             rec["target_top1_prob"] = tt[
                                 "target_top1_prob"]
-                            rec["kl_divergence"] = tt[
-                                "kl_divergence"]
+                            kl_val = tt["kl_divergence"]
+                            # If KL was not computed in the rejection
+                            # sampler (e.g., EAGLE passes draft_probs=
+                            # None), approximate KL from draft softmax
+                            # top-10 and target logprobs.
+                            if (kl_val is None
+                                    and rec["draft_softmax_top10"]
+                                    is not None
+                                    and sliced is not None
+                                    and i < sliced.logprob_token_ids
+                                    .shape[0]):
+                                kl_val = self._approx_kl_from_topk(
+                                    rec["draft_softmax_top10"],
+                                    sliced, i)
+                            rec["kl_divergence"] = kl_val
                         elif (sliced is not None
                               and i < sliced.logprob_token_ids.shape[0]):
                             # Fallback: extract from target logprobs.
