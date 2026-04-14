@@ -169,6 +169,19 @@ class Scheduler(SchedulerInterface):
         # req_id -> per-output-token draft top-K logprobs (None = no draft)
         self._spec_decode_draft_lp: dict[
             str, list[dict[int, float] | None]] = {}
+        # Extended trace state for the nested output format.
+        # req_id -> list of per-token trace records (dicts)
+        self._spec_decode_trace_records: dict[str, list[dict]] = {}
+        # req_id -> current speculative round index
+        self._spec_decode_round_counter: dict[str, int] = {}
+        # req_id -> current global position in generated sequence
+        self._spec_decode_position_counter: dict[str, int] = {}
+        # req_id -> wall-clock start time (monotonic)
+        self._spec_decode_start_time: dict[str, float] = {}
+        # Experiment-level trace config (read once from env vars or JSON).
+        self._trace_config: dict[str, str | int | float] | None = None
+        if self._spec_decode_trace_file is not None:
+            self._trace_config = self._load_trace_config()
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -301,6 +314,50 @@ class Scheduler(SchedulerInterface):
             )
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+
+    @staticmethod
+    def _load_trace_config() -> dict[str, str | int | float]:
+        """Load experiment-level trace metadata from env vars or a JSON
+        config file pointed to by SPEC_DECODE_TRACE_CONFIG.
+
+        Env-var overrides (all optional):
+          SPEC_DECODE_TRACE_PAIR_ID, SPEC_DECODE_TRACE_QUANT_COMBO_ID,
+          SPEC_DECODE_TRACE_DATASET_ID, SPEC_DECODE_TRACE_SAMPLE_ID,
+          SPEC_DECODE_TRACE_DRAFT_MODEL, SPEC_DECODE_TRACE_TARGET_MODEL,
+          SPEC_DECODE_TRACE_DRAFT_QUANT, SPEC_DECODE_TRACE_TARGET_QUANT
+        """
+        cfg: dict[str, str | int | float] = {}
+        config_file = os.environ.get("SPEC_DECODE_TRACE_CONFIG")
+        if config_file:
+            try:
+                with open(config_file) as f:
+                    cfg = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                logger.warning("Failed to load trace config from %s: %s",
+                               config_file, e)
+        # Env-var overrides take precedence.
+        env_map = {
+            "pair_id": "SPEC_DECODE_TRACE_PAIR_ID",
+            "quant_combo_id": "SPEC_DECODE_TRACE_QUANT_COMBO_ID",
+            "dataset_id": "SPEC_DECODE_TRACE_DATASET_ID",
+            "sample_id": "SPEC_DECODE_TRACE_SAMPLE_ID",
+            "draft_model": "SPEC_DECODE_TRACE_DRAFT_MODEL",
+            "target_model": "SPEC_DECODE_TRACE_TARGET_MODEL",
+            "draft_quant": "SPEC_DECODE_TRACE_DRAFT_QUANT",
+            "target_quant": "SPEC_DECODE_TRACE_TARGET_QUANT",
+        }
+        for key, env_var in env_map.items():
+            val = os.environ.get(env_var)
+            if val is not None:
+                # Try to parse as int for sample_id.
+                if key == "sample_id":
+                    try:
+                        cfg[key] = int(val)
+                    except ValueError:
+                        cfg[key] = val
+                else:
+                    cfg[key] = val
+        return cfg
 
     def _mamba_block_aligned_split(
         self,
@@ -1403,13 +1460,31 @@ class Scheduler(SchedulerInterface):
                     req_id, [])
                 d_lp_list = self._spec_decode_draft_lp.setdefault(
                     req_id, [])
+                records = self._spec_decode_trace_records.setdefault(
+                    req_id, [])
+                pos_counter = self._spec_decode_position_counter.setdefault(
+                    req_id, 0)
+                round_counter = self._spec_decode_round_counter.setdefault(
+                    req_id, 0)
+
+                # Ensure wall-clock start time is recorded.
+                if req_id not in self._spec_decode_start_time:
+                    self._spec_decode_start_time[req_id] = time.monotonic()
+
+                from vllm.v1.spec_decode import trace_state
 
                 if scheduled_spec_token_ids and generated_token_ids:
                     # ── Speculative step ──────────────────────────────────
                     trace.extend([True] * num_accepted)
                     trace.append(num_accepted >= num_draft_tokens)
 
+                    # Fetch draft and target side-channel data.
+                    all_draft_lp = trace_state.pop_draft_logprobs(req_id)
+                    all_draft_trace = trace_state.pop_draft_trace(req_id)
+                    all_target_trace = trace_state.pop_target_trace(req_id)
+
                     # Target logprobs: one per output token (accepted + bonus)
+                    sliced = None
                     if logprobs is not None:
                         sliced = logprobs.slice_request(
                             req_index, len(generated_token_ids))
@@ -1424,24 +1499,95 @@ class Scheduler(SchedulerInterface):
                     else:
                         t_lp_list.extend([None] * len(generated_token_ids))
 
-                    # Draft logprobs: accepted positions + correction/bonus.
-                    # all_draft_lp[i] is the draft's distribution at step i.
-                    # For the correction token (first rejected position), use
-                    # all_draft_lp[num_accepted] so KL can be computed there
-                    # too — this is where draft vs target diverges most.
-                    from vllm.v1.spec_decode import trace_state
-                    all_draft_lp = trace_state.pop_draft_logprobs(req_id)
+                    # Draft logprobs (backward compat).
                     for i in range(num_accepted):
                         d_lp_list.append(
-                            all_draft_lp[i] if i < len(all_draft_lp) else None
-                        )
-                    # Bonus/correction token: use draft's logprob at that step
-                    # if available (i.e. the draft proposed something there).
+                            all_draft_lp[i] if i < len(all_draft_lp)
+                            else None)
                     correction_lp = (
                         all_draft_lp[num_accepted]
-                        if num_accepted < len(all_draft_lp) else None
-                    )
+                        if num_accepted < len(all_draft_lp) else None)
                     d_lp_list.append(correction_lp)
+
+                    # Build per-token trace records for this round.
+                    all_accepted = (num_accepted >= num_draft_tokens)
+                    for i in range(len(generated_token_ids)):
+                        token_id = generated_token_ids[i]
+                        is_accepted = (i < num_accepted) or (
+                            i == num_accepted and all_accepted)
+                        # is_rejection_position: the first rejected token
+                        is_rejection = (
+                            i == num_accepted and not all_accepted)
+                        pos_in_round = i
+
+                        rec: dict = {
+                            "position": pos_counter,
+                            "token_id": token_id,
+                            "token_str": None,
+                            "accepted": is_accepted,
+                            "is_rejection_position": is_rejection,
+                            "speculative_round": round_counter,
+                            "position_in_round": pos_in_round,
+                        }
+
+                        # Draft-side trace data.
+                        draft_idx = i
+                        if draft_idx < len(all_draft_trace):
+                            dt = all_draft_trace[draft_idx]
+                            rec["draft_logits_top10"] = [
+                                {"id": tid, "logit": val}
+                                for tid, val in zip(
+                                    dt["logits_top10_ids"],
+                                    dt["logits_top10_vals"])]
+                            rec["draft_softmax_top10"] = [
+                                {"id": tid, "prob": val}
+                                for tid, val in zip(
+                                    dt["softmax_top10_ids"],
+                                    dt["softmax_top10_vals"])]
+                            rec["draft_entropy"] = dt["entropy"]
+                            rec["draft_top1_prob"] = dt["top1_prob"]
+                            rec["draft_top5_prob"] = dt["top5_prob"]
+                        else:
+                            rec["draft_logits_top10"] = None
+                            rec["draft_softmax_top10"] = None
+                            rec["draft_entropy"] = None
+                            rec["draft_top1_prob"] = None
+                            rec["draft_top5_prob"] = None
+
+                        # Target-side trace data.
+                        if draft_idx < len(all_target_trace):
+                            tt = all_target_trace[draft_idx]
+                            rec["target_prob_of_draft_token"] = tt[
+                                "target_prob_of_draft_token"]
+                            rec["target_top1_token_id"] = tt[
+                                "target_top1_token_id"]
+                            rec["target_top1_prob"] = tt[
+                                "target_top1_prob"]
+                            rec["kl_divergence"] = tt[
+                                "kl_divergence"]
+                        elif (sliced is not None
+                              and i < sliced.logprob_token_ids.shape[0]):
+                            # Fallback: extract from target logprobs.
+                            rec["target_top1_token_id"] = int(
+                                sliced.logprob_token_ids[i, 0])
+                            rec["target_top1_prob"] = float(
+                                pow(2.718281828, sliced.logprobs[i, 0]))
+                            rec["target_prob_of_draft_token"] = None
+                            rec["kl_divergence"] = None
+                        else:
+                            rec["target_prob_of_draft_token"] = None
+                            rec["target_top1_token_id"] = None
+                            rec["target_top1_prob"] = None
+                            rec["kl_divergence"] = None
+
+                        records.append(rec)
+                        pos_counter += 1
+
+                    round_counter += 1
+                    self._spec_decode_position_counter[req_id] = (
+                        pos_counter)
+                    self._spec_decode_round_counter[req_id] = (
+                        round_counter)
 
                 elif generated_token_ids:
                     # ── Non-speculative step (prefill / AR decode) ────────
@@ -1460,6 +1606,31 @@ class Scheduler(SchedulerInterface):
                     else:
                         t_lp_list.extend([None] * len(generated_token_ids))
                     d_lp_list.extend([None] * len(generated_token_ids))
+
+                    # Build non-speculative trace records.
+                    for i, token_id in enumerate(generated_token_ids):
+                        rec = {
+                            "position": pos_counter,
+                            "token_id": token_id,
+                            "token_str": None,
+                            "accepted": True,
+                            "is_rejection_position": False,
+                            "speculative_round": None,
+                            "position_in_round": None,
+                            "draft_logits_top10": None,
+                            "draft_softmax_top10": None,
+                            "draft_entropy": None,
+                            "draft_top1_prob": None,
+                            "draft_top5_prob": None,
+                            "target_prob_of_draft_token": None,
+                            "target_top1_token_id": None,
+                            "target_top1_prob": None,
+                            "kl_divergence": None,
+                        }
+                        records.append(rec)
+                        pos_counter += 1
+                    self._spec_decode_position_counter[req_id] = (
+                        pos_counter)
 
             stopped = False
             new_logprobs = None
@@ -1892,27 +2063,81 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         assert request.is_finished()
 
-        # Write per-token acceptance + logprobs trace for this request.
+        # Write per-token trace for this request in the nested format.
         if self._spec_decode_trace_file is not None:
             req_id = request.request_id
             mask = self._spec_decode_trace.pop(req_id, None)
+            records = self._spec_decode_trace_records.pop(req_id, None)
             if mask is not None:
+                # Compute summary statistics.
+                total_accepted = sum(1 for b in mask if b)
+                total_rejected = len(mask) - total_accepted
+                acceptance_rate = (
+                    total_accepted / len(mask) if mask else 0.0)
+                num_rounds = self._spec_decode_round_counter.get(
+                    req_id, 0)
+                start_t = self._spec_decode_start_time.get(req_id)
+                wall_time = (
+                    time.monotonic() - start_t if start_t else None)
+
+                # Build metadata envelope.
+                speculative_config = self.vllm_config.speculative_config
+                gamma = (
+                    speculative_config.num_speculative_tokens
+                    if speculative_config else None)
+                temperature = None
+                if request.sampling_params is not None:
+                    temperature = request.sampling_params.temperature
+
                 entry: dict = {
                     "request_id": req_id,
-                    "acceptance": mask,
-                    "target_logprobs": self._spec_decode_target_lp.pop(
-                        req_id, None),
-                    "draft_logprobs": self._spec_decode_draft_lp.pop(
-                        req_id, None),
                 }
+                # Inject experiment-level metadata from trace config.
+                if self._trace_config:
+                    for key in ("pair_id", "quant_combo_id",
+                                "dataset_id", "sample_id",
+                                "draft_model", "target_model",
+                                "draft_quant", "target_quant"):
+                        if key in self._trace_config:
+                            entry[key] = self._trace_config[key]
+                # Inject model names from config if not in trace_config.
+                if "draft_model" not in entry and speculative_config:
+                    dm = speculative_config.draft_model_config
+                    if dm is not None:
+                        entry["draft_model"] = dm.model
+                if "target_model" not in entry:
+                    entry["target_model"] = (
+                        self.vllm_config.model_config.model)
+
+                entry.update({
+                    "gamma": gamma,
+                    "temperature": temperature,
+                    "prompt_token_count": request.num_prompt_tokens,
+                    "generated_token_count": len(records) if records
+                                             else len(mask),
+                    "total_accepted": total_accepted,
+                    "total_rejected": total_rejected,
+                    "acceptance_rate": round(acceptance_rate, 4),
+                    "num_speculative_rounds": num_rounds,
+                    "wall_time_seconds": round(wall_time, 4)
+                                         if wall_time else None,
+                    "trace": records if records else [],
+                })
                 try:
                     with open(self._spec_decode_trace_file, "a") as f:
                         f.write(json.dumps(entry) + "\n")
                 except OSError:
                     pass
-            # Clean up even if mask was None
+
+            # Clean up all trace state for this request.
             self._spec_decode_target_lp.pop(req_id, None)
             self._spec_decode_draft_lp.pop(req_id, None)
+            self._spec_decode_trace_records.pop(req_id, None)
+            self._spec_decode_round_counter.pop(req_id, None)
+            self._spec_decode_position_counter.pop(req_id, None)
+            self._spec_decode_start_time.pop(req_id, None)
+            from vllm.v1.spec_decode import trace_state
+            trace_state.cleanup_request(req_id)
 
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
