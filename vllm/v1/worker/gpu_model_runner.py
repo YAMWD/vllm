@@ -214,10 +214,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# DIAG (TEMP, revert before submit): Problem 2 instrumentation.
-import os as _diag_os
-_DIAG = _diag_os.environ.get("VLLM_TRACE_DIAG", "0") == "1"
-
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -3342,15 +3338,6 @@ class GPUModelRunner(
 
         # Deposit target-side trace data when tracing is enabled.
         target_trace = self.rejection_sampler.pop_target_trace_buf()
-        # DIAG (TEMP, revert before submit): Checkpoint B — what did the
-        # rejection sampler send and how is the gpu_model_runner pairing it
-        # with req_ids?
-        if _DIAG and target_trace:
-            import sys
-            print(f"[DIAG-B gpu_model_runner] num_reqs={self.input_batch.num_reqs} req_ids={list(self.input_batch.req_ids[:self.input_batch.num_reqs])} len(target_trace)={len(target_trace)}", file=sys.stderr, flush=True)
-            for ri, rr in enumerate(target_trace):
-                bonus_pattern = [d.get("is_bonus_slot") for d in rr]
-                print(f"[DIAG-B gpu_model_runner]   target_trace[{ri}] len={len(rr)} is_bonus={bonus_pattern}", file=sys.stderr, flush=True)
         if target_trace:
             from vllm.v1.spec_decode import trace_state
             num_reqs = self.input_batch.num_reqs

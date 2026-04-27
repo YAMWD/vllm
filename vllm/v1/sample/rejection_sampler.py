@@ -24,9 +24,6 @@ logger = init_logger(__name__)
 # Module-level flag: read once at import time for zero overhead when unset.
 _TRACE_ENABLED: bool = bool(os.environ.get("VLLM_SPEC_DECODE_TRACE_FILE"))
 
-# DIAG (TEMP, revert before submit): Problem 2 instrumentation.
-_DIAG = os.environ.get("VLLM_TRACE_DIAG", "0") == "1"
-
 PLACEHOLDER_TOKEN_ID: tl.constexpr = -1
 GREEDY_TEMPERATURE: tl.constexpr = 0
 # Maximum number of speculative draft tokens allowed per request in a single
@@ -401,15 +398,6 @@ class RejectionSampler(nn.Module):
                     "is_bonus_slot": True,
                 })
             per_request_results.append(req_results)
-        # DIAG (TEMP, revert before submit): Checkpoint A — what does the
-        # rejection sampler actually put into its buffer, per req_idx?
-        if _DIAG:
-            import sys
-            print(f"[DIAG-A reject_sampler] batch_size={batch_size} num_draft_tokens={list(metadata.num_draft_tokens)}", file=sys.stderr, flush=True)
-            for ri, rr in enumerate(per_request_results):
-                bonus_pattern = [d.get("is_bonus_slot") for d in rr]
-                tpod_pattern = [d.get("target_prob_of_draft_token") for d in rr]
-                print(f"[DIAG-A reject_sampler]   req_idx={ri} len={len(rr)} is_bonus={bonus_pattern} t_prob_of_draft={[None if v is None else round(v,4) for v in tpod_pattern]}", file=sys.stderr, flush=True)
         self._target_trace_buf = per_request_results
 
     def pop_target_trace_buf(self) -> list[list[dict]]:
