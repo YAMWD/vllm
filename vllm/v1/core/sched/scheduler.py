@@ -65,6 +65,9 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+# DIAG (TEMP, revert before submit): Problem 2 instrumentation.
+_DIAG = os.environ.get("VLLM_TRACE_DIAG", "0") == "1"
+
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -1536,6 +1539,14 @@ class Scheduler(SchedulerInterface):
                     all_draft_lp = trace_state.pop_draft_logprobs(req_id)
                     all_draft_trace = trace_state.pop_draft_trace(req_id)
                     all_target_trace = trace_state.pop_target_trace(req_id)
+                    # DIAG (TEMP, revert before submit): Checkpoint C — what
+                    # does the scheduler ACTUALLY consume per req_id?
+                    if _DIAG and all_target_trace:
+                        import sys
+                        bonus_pattern = [d.get("is_bonus_slot") for d in all_target_trace]
+                        tpod_pattern = [d.get("target_prob_of_draft_token") for d in all_target_trace]
+                        t_top1_pattern = [d.get("target_top1_token_id") for d in all_target_trace]
+                        print(f"[DIAG-C scheduler] req_id={req_id} len(all_target_trace)={len(all_target_trace)} num_accepted={num_accepted} num_draft_tokens={num_draft_tokens} is_bonus={bonus_pattern} t_prob_of_draft={[None if v is None else round(v,4) for v in tpod_pattern]} t_top1_id={t_top1_pattern}", file=sys.stderr, flush=True)
 
                     # Target logprobs: one per output token (accepted + bonus)
                     sliced = None
