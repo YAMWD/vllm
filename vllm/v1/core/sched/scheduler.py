@@ -1619,6 +1619,17 @@ class Scheduler(SchedulerInterface):
                             "accepted": is_accepted,
                             "is_rejection_position": is_rejection,
                             "was_rolled_back": is_rolled_back,
+                            # Mod E: explicit bonus-slot flag. Set to the
+                            # actual bonus boolean below when we read the
+                            # target-side trace dict (which carries the
+                            # internal `is_bonus_slot` marker added by Mod
+                            # C). Defaults to False here so accept,
+                            # rejection, rolled-back, and any branch that
+                            # falls through without consulting the target
+                            # buffer all emit False — only the genuine
+                            # bonus slot at position_in_round == gamma in
+                            # full-accept rounds gets flipped to True.
+                            "is_bonus_slot": False,
                             "speculative_round": round_counter,
                             "position_in_round": pos_in_round,
                         }
@@ -1673,6 +1684,13 @@ class Scheduler(SchedulerInterface):
                         if draft_idx < len(all_target_trace):
                             tt = all_target_trace[draft_idx]
                             is_bonus = tt.get("is_bonus_slot", False)
+                            # Mod E: surface the internal Mod-C marker on
+                            # the emitted record. The cross-check invariant
+                            # is is_bonus_slot == (accepted and not
+                            # is_rejection_position and not was_rolled_back
+                            # and position_in_round == gamma and
+                            # position > 0).
+                            rec["is_bonus_slot"] = is_bonus
                             # Defense-in-depth (Finding 4 tidy-up): even
                             # if the upstream dict had a non-null
                             # target_prob_of_draft_token, force it to
@@ -1769,6 +1787,12 @@ class Scheduler(SchedulerInterface):
                             "accepted": True,
                             "is_rejection_position": False,
                             "was_rolled_back": False,
+                            # Mod E: prefill / AR-decode tokens (including
+                            # the position-0 bootstrap) are never bonus
+                            # slots. Bonus slots only exist at
+                            # position_in_round == gamma in full-accept
+                            # speculative rounds.
+                            "is_bonus_slot": False,
                             "speculative_round": None,
                             "position_in_round": None,
                             "draft_logits_top10": None,
