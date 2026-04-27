@@ -1548,9 +1548,47 @@ class Scheduler(SchedulerInterface):
                     d_lp_list.append(correction_lp)
 
                     # Build per-token trace records for this round.
+                    #
+                    # Slot-type semantics (Mod B retains rolled-back slots):
+                    #   * Reject round: iterate `num_draft_tokens` slots.
+                    #     Slots [0, num_accepted)        -> accepted draft
+                    #     Slot   num_accepted            -> rejection slot
+                    #     Slots (num_accepted, gamma)    -> rolled-back
+                    #     The output `generated_token_ids` only contains
+                    #     `num_accepted + 1` tokens (accepts + recovered),
+                    #     so for rolled-back slots we read the original
+                    #     draft proposal from `scheduled_spec_token_ids`
+                    #     (which is the full gamma-length proposal list).
+                    #   * Full-accept round: iterate `num_draft_tokens + 1`
+                    #     slots = `len(generated_token_ids)`. The +1 is
+                    #     the bonus slot whose target fields are filled by
+                    #     Mod C; bonus draft top-10 is read from the next
+                    #     round's first draft step (which conditions on
+                    #     the same prefix), giving it draft fields via
+                    #     `all_draft_trace[gamma]` when present.
                     all_accepted = (num_accepted >= num_draft_tokens)
-                    for i in range(len(generated_token_ids)):
-                        token_id = generated_token_ids[i]
+                    if all_accepted:
+                        # gamma accepts + 1 bonus
+                        n_slots = len(generated_token_ids)
+                    else:
+                        # gamma slots: num_accepted accepts + 1 rejection
+                        # + (gamma - num_accepted - 1) rolled-back
+                        n_slots = num_draft_tokens
+                    for i in range(n_slots):
+                        # token_id: for accepts and the rejection slot it
+                        # comes from `generated_token_ids` (the actual
+                        # committed/recovered output). For rolled-back
+                        # slots it comes from `scheduled_spec_token_ids`
+                        # (the draft's preempted proposal). For the bonus
+                        # slot (full-accept only) it comes from
+                        # `generated_token_ids` (the target-sampled
+                        # bonus token).
+                        is_rolled_back = (
+                            (not all_accepted) and i > num_accepted)
+                        if is_rolled_back:
+                            token_id = scheduled_spec_token_ids[i]
+                        else:
+                            token_id = generated_token_ids[i]
                         is_accepted = (i < num_accepted) or (
                             i == num_accepted and all_accepted)
                         # is_rejection_position: the first rejected token
@@ -1564,6 +1602,7 @@ class Scheduler(SchedulerInterface):
                             "token_str": None,
                             "accepted": is_accepted,
                             "is_rejection_position": is_rejection,
+                            "was_rolled_back": is_rolled_back,
                             "speculative_round": round_counter,
                             "position_in_round": pos_in_round,
                         }
@@ -1599,6 +1638,12 @@ class Scheduler(SchedulerInterface):
                         # the parallel target forward-pass output. Mod D
                         # uses both top-10 dicts to compute KL on the
                         # union of ids with epsilon-smoothing.
+                        # Mod B: rolled-back slots reuse the same target
+                        # buffer entry — the parallel target forward
+                        # already computed top-10 at all gamma draft
+                        # positions, so `all_target_trace[i]` is valid
+                        # for every i in [0, gamma) regardless of whether
+                        # slot i was committed, rejected, or rolled back.
                         if draft_idx < len(all_target_trace):
                             tt = all_target_trace[draft_idx]
                             rec["target_prob_of_draft_token"] = tt[
@@ -1629,6 +1674,14 @@ class Scheduler(SchedulerInterface):
                         elif (sliced is not None
                               and i < sliced.logprob_token_ids.shape[0]):
                             # Fallback: extract from target logprobs.
+                            # Reached for the bonus slot (full-accept,
+                            # i == gamma >= len(all_target_trace)) before
+                            # Mod C extends the target buffer. Mod C
+                            # populates target_logits_top10 /
+                            # target_softmax_top10 here from the bonus
+                            # logits; target_prob_of_draft_token stays
+                            # explicitly null (no draft proposal scored
+                            # at the bonus slot).
                             rec["target_top1_token_id"] = int(
                                 sliced.logprob_token_ids[i, 0])
                             rec["target_top1_prob"] = float(
@@ -1680,6 +1733,7 @@ class Scheduler(SchedulerInterface):
                             "token_str": None,
                             "accepted": True,
                             "is_rejection_position": False,
+                            "was_rolled_back": False,
                             "speculative_round": None,
                             "position_in_round": None,
                             "draft_logits_top10": None,
