@@ -1644,10 +1644,26 @@ class Scheduler(SchedulerInterface):
                         # positions, so `all_target_trace[i]` is valid
                         # for every i in [0, gamma) regardless of whether
                         # slot i was committed, rejected, or rolled back.
+                        # Mod C: the rejection sampler appends a bonus
+                        # dict at index gamma per request, so for
+                        # full-accept rounds `all_target_trace[gamma]`
+                        # holds the bonus slot's target top-10 / top-1
+                        # extracted from `bonus_logits` (the same
+                        # parallel forward pass that produced the bonus
+                        # token). The bonus dict is flagged
+                        # `is_bonus_slot=True` and has
+                        # target_prob_of_draft_token=None (no draft
+                        # proposal scored at the bonus slot).
                         if draft_idx < len(all_target_trace):
                             tt = all_target_trace[draft_idx]
-                            rec["target_prob_of_draft_token"] = tt[
-                                "target_prob_of_draft_token"]
+                            is_bonus = tt.get("is_bonus_slot", False)
+                            # Defense-in-depth (Finding 4 tidy-up): even
+                            # if the upstream dict had a non-null
+                            # target_prob_of_draft_token, force it to
+                            # None on the bonus slot.
+                            rec["target_prob_of_draft_token"] = (
+                                None if is_bonus else
+                                tt["target_prob_of_draft_token"])
                             rec["target_top1_token_id"] = tt[
                                 "target_top1_token_id"]
                             rec["target_top1_prob"] = tt[
@@ -1673,15 +1689,12 @@ class Scheduler(SchedulerInterface):
                             rec["kl_divergence"] = kl_val
                         elif (sliced is not None
                               and i < sliced.logprob_token_ids.shape[0]):
-                            # Fallback: extract from target logprobs.
-                            # Reached for the bonus slot (full-accept,
-                            # i == gamma >= len(all_target_trace)) before
-                            # Mod C extends the target buffer. Mod C
-                            # populates target_logits_top10 /
-                            # target_softmax_top10 here from the bonus
-                            # logits; target_prob_of_draft_token stays
-                            # explicitly null (no draft proposal scored
-                            # at the bonus slot).
+                            # Legacy fallback: extract from target
+                            # logprobs. Reached only if the bonus dict
+                            # is unavailable (e.g., the rejection
+                            # sampler was bypassed) — under normal Mod
+                            # C operation this branch is dead at the
+                            # bonus slot.
                             rec["target_top1_token_id"] = int(
                                 sliced.logprob_token_ids[i, 0])
                             rec["target_top1_prob"] = float(

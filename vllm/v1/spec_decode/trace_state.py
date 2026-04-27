@@ -46,13 +46,18 @@ _draft_logprobs: dict[str, list[dict[int, float]]] = {}
 _draft_trace_data: dict[str, list[dict[str, Any]]] = {}
 
 # req_id -> list[ dict with keys:
-#   "target_prob_of_draft_token": float,
+#   "target_prob_of_draft_token": float | None,
 #   "target_top1_token_id": int,
 #   "target_top1_prob": float,
 #   "target_top10_logits": list[{"id": int, "logit": float}],   # Mod A
 #   "target_top10_softmax": list[{"id": int, "prob": float}],   # Mod A
 #   "kl_divergence": float | None,
+#   "is_bonus_slot": bool,                                       # Mod C
 # ]
+# For each round, the rejection sampler emits gamma + 1 entries per
+# request: gamma verify slots followed by one bonus slot. The bonus
+# slot's target_prob_of_draft_token is always None (no draft proposal
+# scored at the bonus position).
 _target_trace_data: dict[str, list[dict[str, Any]]] = {}
 
 
