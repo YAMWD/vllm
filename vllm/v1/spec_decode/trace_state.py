@@ -22,7 +22,9 @@ Extended trace data (_draft_trace_data[req_id]):
 Target trace data (_target_trace_data[req_id]):
   A flat list of dicts deposited from the rejection sampler, containing
   per-position target-side statistics: target_prob_of_draft_token,
-  target_top1_token_id, target_top1_prob, kl_divergence.
+  target_top1_token_id, target_top1_prob, kl_divergence, plus (Mod A)
+  target_top10_logits and target_top10_softmax for symmetric KL
+  computation on the union of draft + target top-10 ids.
 """
 
 from __future__ import annotations
@@ -47,7 +49,9 @@ _draft_trace_data: dict[str, list[dict[str, Any]]] = {}
 #   "target_prob_of_draft_token": float,
 #   "target_top1_token_id": int,
 #   "target_top1_prob": float,
-#   "kl_divergence": float,
+#   "target_top10_logits": list[{"id": int, "logit": float}],   # Mod A
+#   "target_top10_softmax": list[{"id": int, "prob": float}],   # Mod A
+#   "kl_divergence": float | None,
 # ]
 _target_trace_data: dict[str, list[dict[str, Any]]] = {}
 

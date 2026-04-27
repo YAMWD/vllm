@@ -1593,6 +1593,12 @@ class Scheduler(SchedulerInterface):
                             rec["draft_top5_prob"] = None
 
                         # Target-side trace data.
+                        # Mod A: target_logits_top10 / target_softmax_top10
+                        # are the symmetric counterpart to draft_*_top10
+                        # and are populated by the rejection sampler from
+                        # the parallel target forward-pass output. Mod D
+                        # uses both top-10 dicts to compute KL on the
+                        # union of ids with epsilon-smoothing.
                         if draft_idx < len(all_target_trace):
                             tt = all_target_trace[draft_idx]
                             rec["target_prob_of_draft_token"] = tt[
@@ -1601,6 +1607,10 @@ class Scheduler(SchedulerInterface):
                                 "target_top1_token_id"]
                             rec["target_top1_prob"] = tt[
                                 "target_top1_prob"]
+                            rec["target_logits_top10"] = tt.get(
+                                "target_top10_logits")
+                            rec["target_softmax_top10"] = tt.get(
+                                "target_top10_softmax")
                             kl_val = tt["kl_divergence"]
                             # If KL was not computed in the rejection
                             # sampler (e.g., EAGLE passes draft_probs=
@@ -1624,11 +1634,15 @@ class Scheduler(SchedulerInterface):
                             rec["target_top1_prob"] = float(
                                 pow(2.718281828, sliced.logprobs[i, 0]))
                             rec["target_prob_of_draft_token"] = None
+                            rec["target_logits_top10"] = None
+                            rec["target_softmax_top10"] = None
                             rec["kl_divergence"] = None
                         else:
                             rec["target_prob_of_draft_token"] = None
                             rec["target_top1_token_id"] = None
                             rec["target_top1_prob"] = None
+                            rec["target_logits_top10"] = None
+                            rec["target_softmax_top10"] = None
                             rec["kl_divergence"] = None
 
                         records.append(rec)
@@ -1676,6 +1690,8 @@ class Scheduler(SchedulerInterface):
                             "target_prob_of_draft_token": None,
                             "target_top1_token_id": None,
                             "target_top1_prob": None,
+                            "target_logits_top10": None,
+                            "target_softmax_top10": None,
                             "kl_divergence": None,
                         }
                         records.append(rec)

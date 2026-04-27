@@ -240,18 +240,34 @@ class RejectionSampler(nn.Module):
         - target_prob_of_draft_token: target softmax probability at the
           draft-chosen token
         - target_top1_token_id / target_top1_prob: target model's argmax
+        - target_top10_logits / target_top10_softmax: full top-10 logit
+          and softmax distribution (Mod A — surfaces the symmetric
+          counterpart to draft_*_top10 for KL on union of top-10s).
         - kl_divergence: KL(draft || target) top-k approximation
+          (only populated when draft_probs is provided; otherwise the
+          scheduler computes KL from draft + target top-10 dicts via
+          Mod D.)
 
         Results are stored in self._target_trace_buf as a list (per request)
         of lists (per position) of dicts.
         """
         batch_size = len(metadata.num_draft_tokens)
         draft_token_ids = metadata.draft_token_ids
-        cu = metadata.cu_num_draft_tokens
 
-        # Compute target softmax once over all draft positions.
-        target_probs = torch.softmax(target_logits.float(), dim=-1)
+        # Compute target softmax + raw logits top-10 once over all draft
+        # positions (vectorized; cheaper than per-slot).
+        target_logits_f = target_logits.float()
+        target_probs = torch.softmax(target_logits_f, dim=-1)
         target_top1 = target_probs.max(dim=-1)  # values, indices
+        # Raw logit top-10 (Mod A) — sorted descending by logit.
+        raw_top10 = torch.topk(target_logits_f, k=10, dim=-1)
+        # Softmax top-10 (Mod A) — sorted descending by prob.
+        sm_top10 = torch.topk(target_probs, k=10, dim=-1)
+        # Move to CPU once for cheap per-slot dict construction below.
+        raw_top10_ids_cpu = raw_top10.indices.cpu()
+        raw_top10_vals_cpu = raw_top10.values.cpu()
+        sm_top10_ids_cpu = sm_top10.indices.cpu()
+        sm_top10_vals_cpu = sm_top10.values.cpu()
 
         per_request_results: list[list[dict]] = []
         offset = 0
@@ -265,11 +281,23 @@ class RejectionSampler(nn.Module):
                 t_top1_id = int(target_top1.indices[tidx].item())
                 t_top1_p = float(target_top1.values[tidx].item())
 
+                # Build top-10 dicts (Mod A). Lists of {id, logit/prob}.
+                t_logits_top10 = [
+                    {"id": int(raw_top10_ids_cpu[tidx, j]),
+                     "logit": float(raw_top10_vals_cpu[tidx, j])}
+                    for j in range(10)
+                ]
+                t_softmax_top10 = [
+                    {"id": int(sm_top10_ids_cpu[tidx, j]),
+                     "prob": float(sm_top10_vals_cpu[tidx, j])}
+                    for j in range(10)
+                ]
+
                 # KL(draft || target) approximation using top-k.
                 # When draft_probs is None (e.g., EAGLE with greedy
                 # decoding), KL cannot be computed here. Set to None
-                # and let the scheduler compute it from draft softmax
-                # data in trace_state if available.
+                # and let the scheduler compute it from draft + target
+                # top-10 softmax dicts (Mod D).
                 kl: float | None = None
                 if draft_probs is not None:
                     # Use top-20 of draft distribution for the approximation.
@@ -290,6 +318,8 @@ class RejectionSampler(nn.Module):
                     "target_prob_of_draft_token": t_prob_at_draft,
                     "target_top1_token_id": t_top1_id,
                     "target_top1_prob": t_top1_p,
+                    "target_top10_logits": t_logits_top10,
+                    "target_top10_softmax": t_softmax_top10,
                     "kl_divergence": kl,
                 })
             offset += n
