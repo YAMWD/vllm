@@ -371,7 +371,14 @@ class RejectionSampler(nn.Module):
             # gamma) of full-accept rounds; for reject rounds the
             # scheduler never emits a bonus record so this entry is
             # discarded when pop_target_trace clears the side-channel.
-            if bonus_top1_ids_cpu is not None:
+            # Mod F: only emit a bonus dict for requests that actually had draft
+            # tokens this step. For prefill-only / no-draft requests the bonus
+            # logits are still computed (rejection_sample needs them to produce
+            # the recovered/bonus token), but emitting a trace dict here would
+            # leak into _target_trace_data because the scheduler's non-speculative
+            # branch never pops it. See vllm_capability_audit_step1_full.md
+            # §"Mod F: bug record".
+            if bonus_top1_ids_cpu is not None and n > 0:
                 bonus_t_logits_top10 = [
                     {"id": int(bonus_raw_top10_ids_cpu[req_idx, j]),
                      "logit": float(bonus_raw_top10_vals_cpu[req_idx, j])}
