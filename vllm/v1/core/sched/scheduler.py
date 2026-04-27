@@ -361,41 +361,57 @@ class Scheduler(SchedulerInterface):
 
     @staticmethod
     def _approx_kl_from_topk(
-        draft_softmax_top10: list[dict],
-        sliced_logprobs,
-        pos: int,
+        draft_softmax_top10: list[dict] | None,
+        target_softmax_top10: list[dict] | None,
     ) -> float | None:
-        """Approximate KL(draft || target) using draft softmax top-10
-        and target logprobs from the model output.
+        """Approximate KL(draft || target) on the union of draft top-10
+        and target top-10 ids with epsilon smoothing (Mod D).
 
-        For each draft top-10 token, look up its target logprob. If
-        found, compute the KL contribution. This is a rough top-k
-        approximation.
+        Both arguments are lists of {"id": int, "prob": float} (top-10
+        of the respective softmax distribution). The KL approximation
+        is:
+            S = ids(draft top-10) ∪ ids(target top-10)
+            For each id in S:
+                p_d = draft.get(id)  or eps
+                p_t = target.get(id) or eps
+                contribution = p_d * log(p_d / p_t)
+            KL = sum of contributions    # in nats
+
+        Notes:
+        - eps = 1e-9 (the schema-canonical value, large enough to
+          avoid -inf when an id is missing from one side, small enough
+          to make the smoothed mass negligible vs. the present-side
+          probabilities).
+        - Returns None if either input is missing or empty (e.g.,
+          position-0 prompt bootstrap).
+        - Returns 0.0 (not None) when the two top-10s agree exactly
+          and their probs match — KL is genuinely zero, not "missing".
+        - The result is in NATS (natural log), per the schema spec.
         """
+        if not draft_softmax_top10 or not target_softmax_top10:
+            return None
         import math
-        # Build target logprob lookup: token_id -> logprob
-        target_lp: dict[int, float] = {}
-        for j in range(sliced_logprobs.logprob_token_ids.shape[1]):
-            tid = int(sliced_logprobs.logprob_token_ids[pos, j])
-            lp = float(sliced_logprobs.logprobs[pos, j])
-            target_lp[tid] = lp
-
+        eps = 1e-9
+        d_map: dict[int, float] = {
+            int(entry["id"]): float(entry["prob"])
+            for entry in draft_softmax_top10
+        }
+        t_map: dict[int, float] = {
+            int(entry["id"]): float(entry["prob"])
+            for entry in target_softmax_top10
+        }
+        union_ids = set(d_map) | set(t_map)
+        if not union_ids:
+            return None
         kl = 0.0
-        n_shared = 0
-        for entry in draft_softmax_top10:
-            tid = entry["id"]
-            p_d = entry["prob"]
-            if p_d <= 1e-12:
-                continue
-            t_lp = target_lp.get(tid)
-            if t_lp is None:
-                continue
-            p_t = math.exp(t_lp)
-            if p_t <= 1e-12:
-                continue
+        for tid in union_ids:
+            p_d = d_map.get(tid, eps)
+            p_t = t_map.get(tid, eps)
+            # Both sides epsilon-smoothed -> log argument is well
+            # defined and finite. Multiply by p_d (which itself is
+            # >= eps), so each term is finite.
             kl += p_d * math.log(p_d / p_t)
-            n_shared += 1
-        return kl if n_shared > 0 else None
+        return kl
 
     def _mamba_block_aligned_split(
         self,
@@ -1673,19 +1689,25 @@ class Scheduler(SchedulerInterface):
                             rec["target_softmax_top10"] = tt.get(
                                 "target_top10_softmax")
                             kl_val = tt["kl_divergence"]
-                            # If KL was not computed in the rejection
-                            # sampler (e.g., EAGLE passes draft_probs=
-                            # None), approximate KL from draft softmax
-                            # top-10 and target logprobs.
+                            # Mod D: if KL was not computed in the
+                            # rejection sampler (e.g., EAGLE / greedy
+                            # paths pass draft_probs=None), compute
+                            # KL(draft || target) on the union of
+                            # draft top-10 and target top-10 ids with
+                            # epsilon smoothing. Both top-10 dicts are
+                            # populated by Mods A + C at every
+                            # non-bootstrap slot, so this branch
+                            # populates kl_divergence for ~100% of
+                            # slots after the gate is closed (was 0%
+                            # before Mod D).
                             if (kl_val is None
                                     and rec["draft_softmax_top10"]
                                     is not None
-                                    and sliced is not None
-                                    and i < sliced.logprob_token_ids
-                                    .shape[0]):
+                                    and rec["target_softmax_top10"]
+                                    is not None):
                                 kl_val = self._approx_kl_from_topk(
                                     rec["draft_softmax_top10"],
-                                    sliced, i)
+                                    rec["target_softmax_top10"])
                             rec["kl_divergence"] = kl_val
                         elif (sliced is not None
                               and i < sliced.logprob_token_ids.shape[0]):

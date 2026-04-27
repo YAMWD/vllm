@@ -250,10 +250,11 @@ class RejectionSampler(nn.Module):
         - target_top10_logits / target_top10_softmax: full top-10 logit
           and softmax distribution (Mod A — surfaces the symmetric
           counterpart to draft_*_top10 for KL on union of top-10s).
-        - kl_divergence: KL(draft || target) top-k approximation
-          (only populated when draft_probs is provided; otherwise the
-          scheduler computes KL from draft + target top-10 dicts via
-          Mod D.)
+        - kl_divergence: always None at this stage. The scheduler
+          computes KL via Mod D using the union of draft top-10 +
+          target top-10 ids with epsilon smoothing (eps = 1e-9), in
+          nats. The `draft_probs` parameter is retained on the
+          signature for back-compat but is no longer used here.
 
         Mod C: also extracts a per-request bonus dict from `bonus_logits`
         and appends it as the (gamma+1)-th entry of each request's list.
@@ -338,26 +339,21 @@ class RejectionSampler(nn.Module):
                     for j in range(10)
                 ]
 
-                # KL(draft || target) approximation using top-k.
-                # When draft_probs is None (e.g., EAGLE with greedy
-                # decoding), KL cannot be computed here. Set to None
-                # and let the scheduler compute it from draft + target
-                # top-10 softmax dicts (Mod D).
+                # KL(draft || target) is left None at this stage. The
+                # scheduler computes it via Mod D using the union of
+                # draft top-10 + target top-10 ids with epsilon
+                # smoothing (ε = 1e-9), in NATS. We do NOT compute the
+                # legacy top-20-of-draft approximation here because:
+                #   (1) it used a different epsilon (1e-12) and a
+                #       different support (draft top-20 only, not the
+                #       union with target top-10), so it disagreed
+                #       with the schema-canonical KL.
+                #   (2) the scheduler-side computation works for ALL
+                #       paths (greedy / EAGLE / random), so we get a
+                #       single source of truth.
+                # The rejection sampler still provides target softmax
+                # rows above; that's all Mod D needs.
                 kl: float | None = None
-                if draft_probs is not None:
-                    # Use top-20 of draft distribution for the approximation.
-                    d_probs_row = draft_probs[tidx]
-                    t_probs_row = target_probs[tidx]
-                    d_top20 = torch.topk(d_probs_row, k=min(20,
-                                         d_probs_row.shape[0]))
-                    d_vals = d_top20.values.float()
-                    t_vals = t_probs_row[d_top20.indices].float()
-                    eps = 1e-12
-                    # KL = sum p_d * log(p_d / p_t) over shared top-k
-                    mask = (d_vals > eps) & (t_vals > eps)
-                    if mask.any():
-                        kl = float((d_vals[mask] * torch.log(
-                            d_vals[mask] / t_vals[mask])).sum().item())
 
                 req_results.append({
                     "target_prob_of_draft_token": t_prob_at_draft,
