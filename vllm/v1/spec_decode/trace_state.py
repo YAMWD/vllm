@@ -25,6 +25,11 @@ Target trace data (_target_trace_data[req_id]):
   target_top1_token_id, target_top1_prob, kl_divergence, plus (Mod A)
   target_top10_logits and target_top10_softmax for symmetric KL
   computation on the union of draft + target top-10 ids.
+
+Mod G: pop_draft_trace accepts an optional ``n`` and pops FIFO so the
+scheduler consumes exactly one round's worth of draft trace per cycle
+(the next round's drafts are deposited in the same cycle and must stay
+buffered).
 """
 
 from __future__ import annotations
@@ -77,9 +82,28 @@ def add_draft_trace(req_id: str, data: dict[str, Any]) -> None:
     _draft_trace_data.setdefault(req_id, []).append(data)
 
 
-def pop_draft_trace(req_id: str) -> list[dict[str, Any]]:
-    """Remove and return all accumulated draft trace data for a request."""
-    return _draft_trace_data.pop(req_id, [])
+def pop_draft_trace(req_id: str,
+                    n: int | None = None) -> list[dict[str, Any]]:
+    """Remove and return up to ``n`` accumulated draft trace records, FIFO.
+
+    Mod G: when ``n`` is provided, only the first ``n`` entries are
+    consumed and the remainder is left in place for the next scheduler
+    step. The scheduler passes ``n=num_draft_tokens`` so that exactly
+    one round's worth of draft trace is consumed per scheduler cycle —
+    the draft proposes for round k+1 in the same cycle that verifies
+    round k, so without this gate ``_draft_trace_data[req_id]`` carries
+    next-round entries that would shift round k's records by γ.
+
+    Backwards compat: ``n=None`` pops everything (legacy behavior).
+    """
+    if req_id not in _draft_trace_data:
+        return []
+    if n is None or n >= len(_draft_trace_data[req_id]):
+        return _draft_trace_data.pop(req_id, [])
+    lst = _draft_trace_data[req_id]
+    result = lst[:n]
+    _draft_trace_data[req_id] = lst[n:]
+    return result
 
 
 def add_target_trace(req_id: str, data: dict[str, Any]) -> None:

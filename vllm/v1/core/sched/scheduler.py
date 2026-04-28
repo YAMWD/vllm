@@ -1534,7 +1534,16 @@ class Scheduler(SchedulerInterface):
 
                     # Fetch draft and target side-channel data.
                     all_draft_lp = trace_state.pop_draft_logprobs(req_id)
-                    all_draft_trace = trace_state.pop_draft_trace(req_id)
+                    # Mod G: FIFO-pop exactly num_draft_tokens entries. The
+                    # drafter deposits γ trace records per cycle (for round
+                    # k+1's verify), but the scheduler consumes records here
+                    # for round k's verify, whose draft trace was deposited
+                    # in the *previous* cycle. Without this gate,
+                    # all_draft_trace would contain both rounds' deposits
+                    # concatenated, and round k's records would be shifted
+                    # by γ.
+                    all_draft_trace = trace_state.pop_draft_trace(
+                        req_id, n=num_draft_tokens)
                     all_target_trace = trace_state.pop_target_trace(req_id)
 
                     # Target logprobs: one per output token (accepted + bonus)
