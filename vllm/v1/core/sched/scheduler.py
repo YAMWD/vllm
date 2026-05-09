@@ -2281,11 +2281,41 @@ class Scheduler(SchedulerInterface):
             mask = self._spec_decode_trace.pop(req_id, None)
             records = self._spec_decode_trace_records.pop(req_id, None)
             if mask is not None:
-                # Compute summary statistics.
-                total_accepted = sum(1 for b in mask if b)
-                total_rejected = len(mask) - total_accepted
+                # Mod H follow-up: compute envelope counters from `records`,
+                # the structured per-slot trace, instead of from `mask`.
+                # `mask` includes a True for the position-0 bootstrap (added
+                # via the non-speculative branch's `trace.extend([True] *
+                # len(generated_token_ids))`), which inflated `total_accepted`
+                # and `len(mask)` by 1. The committed generated-token stream
+                # is exactly the records that are NOT the bootstrap and NOT
+                # rolled-back; per `experiment_plan_slurm/step1_traces.md:263`
+                # `generated_token_count == total_accepted + total_rejected`,
+                # and `acceptance_rate = total_accepted / generated_token_count`.
+                _records = records or []
+
+                def _is_bootstrap_record(r: dict) -> bool:
+                    return (
+                        r.get("position") == 0
+                        and r.get("speculative_round") is None
+                        and not r.get("was_rolled_back", False)
+                        and not r.get("is_rejection_position", False)
+                    )
+
+                committed_records = [
+                    r for r in _records
+                    if not _is_bootstrap_record(r)
+                    and not r.get("was_rolled_back", False)
+                ]
+                generated_token_count = len(committed_records)
+                total_accepted = sum(
+                    1 for r in committed_records
+                    if r.get("accepted") is True)
+                total_rejected = sum(
+                    1 for r in committed_records
+                    if r.get("is_rejection_position") is True)
                 acceptance_rate = (
-                    total_accepted / len(mask) if mask else 0.0)
+                    total_accepted / generated_token_count
+                    if generated_token_count else 0.0)
                 num_rounds = self._spec_decode_round_counter.get(
                     req_id, 0)
                 start_t = self._spec_decode_start_time.get(req_id)
@@ -2328,13 +2358,7 @@ class Scheduler(SchedulerInterface):
                     "temperature": temperature,
                     "top_p": top_p,
                     "prompt_token_count": request.num_prompt_tokens,
-                    # Mod H: generated_token_count is the count of committed
-                    # tokens (accepts + rejections), which equals len(mask).
-                    # The previous `len(records)` form included the bootstrap
-                    # and rolled-back records, inflating the count by ~10%.
-                    # The schema spec (step1_traces.md:263) requires
-                    # generated_token_count == total_accepted + total_rejected.
-                    "generated_token_count": len(mask),
+                    "generated_token_count": generated_token_count,
                     "total_accepted": total_accepted,
                     "total_rejected": total_rejected,
                     "acceptance_rate": round(acceptance_rate, 4),
