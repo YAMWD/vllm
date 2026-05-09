@@ -1622,7 +1622,16 @@ class Scheduler(SchedulerInterface):
                         pos_in_round = i
 
                         rec: dict = {
-                            "position": pos_counter,
+                            # Mod H: position is pos_counter + i (the slot's
+                            # offset into this round). For the worked example,
+                            # this gives round 0 slots positions 1..5 (with
+                            # rolled-back at 4, 5) and round 1 slots positions
+                            # 4..9 — the rolled-back positions correctly
+                            # overlap with the next round's accepts. After the
+                            # loop we advance pos_counter by the COMMITTED
+                            # count (num_accepted + 1 for reject rounds;
+                            # n_slots for full-accept rounds), NOT by n_slots.
+                            "position": pos_counter + i,
                             "token_id": token_id,
                             "token_str": None,
                             "accepted": is_accepted,
@@ -1761,7 +1770,21 @@ class Scheduler(SchedulerInterface):
                             rec["kl_divergence"] = None
 
                         records.append(rec)
-                        pos_counter += 1
+                        # Mod H: removed `pos_counter += 1` from per-slot
+                        # increment. Position counter now advances by the
+                        # round's committed count, computed below.
+
+                    # Mod H: advance pos_counter by committed count only.
+                    # Full-accept rounds commit n_slots tokens (γ accepts
+                    # + 1 bonus). Reject rounds commit num_accepted + 1
+                    # tokens (k accepts + 1 rejection); the remaining
+                    # γ - num_accepted - 1 rolled-back slots do NOT
+                    # advance the committed-stream position.
+                    if all_accepted:
+                        committed_in_round = n_slots
+                    else:
+                        committed_in_round = num_accepted + 1
+                    pos_counter += committed_in_round
 
                     round_counter += 1
                     self._spec_decode_position_counter[req_id] = (
@@ -2305,8 +2328,13 @@ class Scheduler(SchedulerInterface):
                     "temperature": temperature,
                     "top_p": top_p,
                     "prompt_token_count": request.num_prompt_tokens,
-                    "generated_token_count": len(records) if records
-                                             else len(mask),
+                    # Mod H: generated_token_count is the count of committed
+                    # tokens (accepts + rejections), which equals len(mask).
+                    # The previous `len(records)` form included the bootstrap
+                    # and rolled-back records, inflating the count by ~10%.
+                    # The schema spec (step1_traces.md:263) requires
+                    # generated_token_count == total_accepted + total_rejected.
+                    "generated_token_count": len(mask),
                     "total_accepted": total_accepted,
                     "total_rejected": total_rejected,
                     "acceptance_rate": round(acceptance_rate, 4),
