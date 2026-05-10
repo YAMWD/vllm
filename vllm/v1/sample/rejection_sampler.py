@@ -158,9 +158,15 @@ class RejectionSampler(nn.Module):
 
         # Extract target-side trace data when tracing is enabled.
         # This is gated behind _TRACE_ENABLED for zero overhead when unset.
+        # `bonus_logits` is passed so Mod C can populate the bonus slot's
+        # target_logits_top10 / target_softmax_top10 / target_top1_* from
+        # the same parallel target forward-pass output that produced the
+        # bonus token. We pass the *raw* bonus_logits from this forward
+        # pass; that's exactly the distribution the bonus token was
+        # sampled / argmaxed from above.
         if _TRACE_ENABLED:
             self._extract_target_trace(
-                metadata, target_logits, draft_probs)
+                metadata, target_logits, draft_probs, bonus_logits)
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
@@ -232,6 +238,7 @@ class RejectionSampler(nn.Module):
         metadata: SpecDecodeMetadata,
         target_logits: torch.Tensor,
         draft_probs: torch.Tensor | None,
+        bonus_logits: torch.Tensor | None = None,
     ) -> None:
         """Extract per-position target-side trace data for speculative
         decoding analysis. Called only when _TRACE_ENABLED is True.
@@ -240,18 +247,73 @@ class RejectionSampler(nn.Module):
         - target_prob_of_draft_token: target softmax probability at the
           draft-chosen token
         - target_top1_token_id / target_top1_prob: target model's argmax
-        - kl_divergence: KL(draft || target) top-k approximation
+        - target_top10_logits / target_top10_softmax: full top-10 logit
+          and softmax distribution (Mod A — surfaces the symmetric
+          counterpart to draft_*_top10 for KL on union of top-10s).
+        - kl_divergence: always None at this stage. The scheduler
+          computes KL via Mod D using the union of draft top-10 +
+          target top-10 ids with epsilon smoothing (eps = 1e-9), in
+          nats. The `draft_probs` parameter is retained on the
+          signature for back-compat but is no longer used here.
+
+        Mod C: also extracts a per-request bonus dict from `bonus_logits`
+        and appends it as the (gamma+1)-th entry of each request's list.
+        The bonus entry's `is_bonus_slot` flag tells the scheduler to
+        explicitly null `target_prob_of_draft_token` (no draft proposal
+        scored at the bonus slot) regardless of what's in this dict.
 
         Results are stored in self._target_trace_buf as a list (per request)
-        of lists (per position) of dicts.
+        of lists (per position) of dicts. For full-accept rounds the list
+        has gamma + 1 entries (gamma verify slots + bonus). For reject
+        rounds it also has gamma + 1 entries (the bonus dict is computed
+        regardless; the scheduler discards it because the bonus slot
+        record is never emitted on reject rounds).
         """
         batch_size = len(metadata.num_draft_tokens)
         draft_token_ids = metadata.draft_token_ids
-        cu = metadata.cu_num_draft_tokens
 
-        # Compute target softmax once over all draft positions.
-        target_probs = torch.softmax(target_logits.float(), dim=-1)
+        # Compute target softmax + raw logits top-10 once over all draft
+        # positions (vectorized; cheaper than per-slot).
+        target_logits_f = target_logits.float()
+        target_probs = torch.softmax(target_logits_f, dim=-1)
         target_top1 = target_probs.max(dim=-1)  # values, indices
+        # Raw logit top-10 (Mod A) — sorted descending by logit.
+        raw_top10 = torch.topk(target_logits_f, k=10, dim=-1)
+        # Softmax top-10 (Mod A) — sorted descending by prob.
+        sm_top10 = torch.topk(target_probs, k=10, dim=-1)
+        # Move to CPU once for cheap per-slot dict construction below.
+        raw_top10_ids_cpu = raw_top10.indices.cpu()
+        raw_top10_vals_cpu = raw_top10.values.cpu()
+        sm_top10_ids_cpu = sm_top10.indices.cpu()
+        sm_top10_vals_cpu = sm_top10.values.cpu()
+
+        # Mod C: precompute per-request bonus top-10 from bonus_logits.
+        # bonus_logits has shape [batch_size, vocab_size] (one row per
+        # request, the logits at the position FOLLOWING the last draft
+        # slot in the round — i.e., the bonus position). For full-accept
+        # rounds the scheduler emits a bonus record at slot gamma; for
+        # reject rounds the bonus record is never emitted, but we
+        # compute the bonus dict regardless because it's a single batch
+        # of forward-pass logits with negligible cost (and the bonus
+        # forward pass already happened in the preceding sampler call).
+        bonus_top1_ids_cpu = None
+        bonus_top1_vals_cpu = None
+        bonus_raw_top10_ids_cpu = None
+        bonus_raw_top10_vals_cpu = None
+        bonus_sm_top10_ids_cpu = None
+        bonus_sm_top10_vals_cpu = None
+        if bonus_logits is not None:
+            bonus_logits_f = bonus_logits.float()
+            bonus_probs = torch.softmax(bonus_logits_f, dim=-1)
+            bonus_top1 = bonus_probs.max(dim=-1)
+            bonus_raw_top10 = torch.topk(bonus_logits_f, k=10, dim=-1)
+            bonus_sm_top10 = torch.topk(bonus_probs, k=10, dim=-1)
+            bonus_top1_ids_cpu = bonus_top1.indices.cpu()
+            bonus_top1_vals_cpu = bonus_top1.values.cpu()
+            bonus_raw_top10_ids_cpu = bonus_raw_top10.indices.cpu()
+            bonus_raw_top10_vals_cpu = bonus_raw_top10.values.cpu()
+            bonus_sm_top10_ids_cpu = bonus_sm_top10.indices.cpu()
+            bonus_sm_top10_vals_cpu = bonus_sm_top10.values.cpu()
 
         per_request_results: list[list[dict]] = []
         offset = 0
@@ -265,34 +327,83 @@ class RejectionSampler(nn.Module):
                 t_top1_id = int(target_top1.indices[tidx].item())
                 t_top1_p = float(target_top1.values[tidx].item())
 
-                # KL(draft || target) approximation using top-k.
-                # When draft_probs is None (e.g., EAGLE with greedy
-                # decoding), KL cannot be computed here. Set to None
-                # and let the scheduler compute it from draft softmax
-                # data in trace_state if available.
+                # Build top-10 dicts (Mod A). Lists of {id, logit/prob}.
+                t_logits_top10 = [
+                    {"id": int(raw_top10_ids_cpu[tidx, j]),
+                     "logit": float(raw_top10_vals_cpu[tidx, j])}
+                    for j in range(10)
+                ]
+                t_softmax_top10 = [
+                    {"id": int(sm_top10_ids_cpu[tidx, j]),
+                     "prob": float(sm_top10_vals_cpu[tidx, j])}
+                    for j in range(10)
+                ]
+
+                # KL(draft || target) is left None at this stage. The
+                # scheduler computes it via Mod D using the union of
+                # draft top-10 + target top-10 ids with epsilon
+                # smoothing (ε = 1e-9), in NATS. We do NOT compute the
+                # legacy top-20-of-draft approximation here because:
+                #   (1) it used a different epsilon (1e-12) and a
+                #       different support (draft top-20 only, not the
+                #       union with target top-10), so it disagreed
+                #       with the schema-canonical KL.
+                #   (2) the scheduler-side computation works for ALL
+                #       paths (greedy / EAGLE / random), so we get a
+                #       single source of truth.
+                # The rejection sampler still provides target softmax
+                # rows above; that's all Mod D needs.
                 kl: float | None = None
-                if draft_probs is not None:
-                    # Use top-20 of draft distribution for the approximation.
-                    d_probs_row = draft_probs[tidx]
-                    t_probs_row = target_probs[tidx]
-                    d_top20 = torch.topk(d_probs_row, k=min(20,
-                                         d_probs_row.shape[0]))
-                    d_vals = d_top20.values.float()
-                    t_vals = t_probs_row[d_top20.indices].float()
-                    eps = 1e-12
-                    # KL = sum p_d * log(p_d / p_t) over shared top-k
-                    mask = (d_vals > eps) & (t_vals > eps)
-                    if mask.any():
-                        kl = float((d_vals[mask] * torch.log(
-                            d_vals[mask] / t_vals[mask])).sum().item())
 
                 req_results.append({
                     "target_prob_of_draft_token": t_prob_at_draft,
                     "target_top1_token_id": t_top1_id,
                     "target_top1_prob": t_top1_p,
+                    "target_top10_logits": t_logits_top10,
+                    "target_top10_softmax": t_softmax_top10,
                     "kl_divergence": kl,
+                    "is_bonus_slot": False,
                 })
             offset += n
+
+            # Mod C: append the bonus-slot dict for this request. The
+            # scheduler will use this entry for the bonus slot (slot
+            # gamma) of full-accept rounds; for reject rounds the
+            # scheduler never emits a bonus record so this entry is
+            # discarded when pop_target_trace clears the side-channel.
+            # Mod F: only emit a bonus dict for requests that actually had draft
+            # tokens this step. For prefill-only / no-draft requests the bonus
+            # logits are still computed (rejection_sample needs them to produce
+            # the recovered/bonus token), but emitting a trace dict here would
+            # leak into _target_trace_data because the scheduler's non-speculative
+            # branch never pops it. See vllm_capability_audit_step1_full.md
+            # §"Mod F: bug record".
+            if bonus_top1_ids_cpu is not None and n > 0:
+                bonus_t_logits_top10 = [
+                    {"id": int(bonus_raw_top10_ids_cpu[req_idx, j]),
+                     "logit": float(bonus_raw_top10_vals_cpu[req_idx, j])}
+                    for j in range(10)
+                ]
+                bonus_t_softmax_top10 = [
+                    {"id": int(bonus_sm_top10_ids_cpu[req_idx, j]),
+                     "prob": float(bonus_sm_top10_vals_cpu[req_idx, j])}
+                    for j in range(10)
+                ]
+                req_results.append({
+                    # No draft proposal exists at the bonus slot, so
+                    # target_prob_of_draft_token is explicitly null
+                    # here. The scheduler ALSO nulls this on emission
+                    # (defense in depth, addresses Finding 4 tidy-up).
+                    "target_prob_of_draft_token": None,
+                    "target_top1_token_id": int(
+                        bonus_top1_ids_cpu[req_idx]),
+                    "target_top1_prob": float(
+                        bonus_top1_vals_cpu[req_idx]),
+                    "target_top10_logits": bonus_t_logits_top10,
+                    "target_top10_softmax": bonus_t_softmax_top10,
+                    "kl_divergence": None,
+                    "is_bonus_slot": True,
+                })
             per_request_results.append(req_results)
         self._target_trace_buf = per_request_results
 

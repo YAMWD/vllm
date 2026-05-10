@@ -361,41 +361,57 @@ class Scheduler(SchedulerInterface):
 
     @staticmethod
     def _approx_kl_from_topk(
-        draft_softmax_top10: list[dict],
-        sliced_logprobs,
-        pos: int,
+        draft_softmax_top10: list[dict] | None,
+        target_softmax_top10: list[dict] | None,
     ) -> float | None:
-        """Approximate KL(draft || target) using draft softmax top-10
-        and target logprobs from the model output.
+        """Approximate KL(draft || target) on the union of draft top-10
+        and target top-10 ids with epsilon smoothing (Mod D).
 
-        For each draft top-10 token, look up its target logprob. If
-        found, compute the KL contribution. This is a rough top-k
-        approximation.
+        Both arguments are lists of {"id": int, "prob": float} (top-10
+        of the respective softmax distribution). The KL approximation
+        is:
+            S = ids(draft top-10) ∪ ids(target top-10)
+            For each id in S:
+                p_d = draft.get(id)  or eps
+                p_t = target.get(id) or eps
+                contribution = p_d * log(p_d / p_t)
+            KL = sum of contributions    # in nats
+
+        Notes:
+        - eps = 1e-9 (the schema-canonical value, large enough to
+          avoid -inf when an id is missing from one side, small enough
+          to make the smoothed mass negligible vs. the present-side
+          probabilities).
+        - Returns None if either input is missing or empty (e.g.,
+          position-0 prompt bootstrap).
+        - Returns 0.0 (not None) when the two top-10s agree exactly
+          and their probs match — KL is genuinely zero, not "missing".
+        - The result is in NATS (natural log), per the schema spec.
         """
+        if not draft_softmax_top10 or not target_softmax_top10:
+            return None
         import math
-        # Build target logprob lookup: token_id -> logprob
-        target_lp: dict[int, float] = {}
-        for j in range(sliced_logprobs.logprob_token_ids.shape[1]):
-            tid = int(sliced_logprobs.logprob_token_ids[pos, j])
-            lp = float(sliced_logprobs.logprobs[pos, j])
-            target_lp[tid] = lp
-
+        eps = 1e-9
+        d_map: dict[int, float] = {
+            int(entry["id"]): float(entry["prob"])
+            for entry in draft_softmax_top10
+        }
+        t_map: dict[int, float] = {
+            int(entry["id"]): float(entry["prob"])
+            for entry in target_softmax_top10
+        }
+        union_ids = set(d_map) | set(t_map)
+        if not union_ids:
+            return None
         kl = 0.0
-        n_shared = 0
-        for entry in draft_softmax_top10:
-            tid = entry["id"]
-            p_d = entry["prob"]
-            if p_d <= 1e-12:
-                continue
-            t_lp = target_lp.get(tid)
-            if t_lp is None:
-                continue
-            p_t = math.exp(t_lp)
-            if p_t <= 1e-12:
-                continue
+        for tid in union_ids:
+            p_d = d_map.get(tid, eps)
+            p_t = t_map.get(tid, eps)
+            # Both sides epsilon-smoothed -> log argument is well
+            # defined and finite. Multiply by p_d (which itself is
+            # >= eps), so each term is finite.
             kl += p_d * math.log(p_d / p_t)
-            n_shared += 1
-        return kl if n_shared > 0 else None
+        return kl
 
     def _mamba_block_aligned_split(
         self,
@@ -1518,7 +1534,16 @@ class Scheduler(SchedulerInterface):
 
                     # Fetch draft and target side-channel data.
                     all_draft_lp = trace_state.pop_draft_logprobs(req_id)
-                    all_draft_trace = trace_state.pop_draft_trace(req_id)
+                    # Mod G: FIFO-pop exactly num_draft_tokens entries. The
+                    # drafter deposits γ trace records per cycle (for round
+                    # k+1's verify), but the scheduler consumes records here
+                    # for round k's verify, whose draft trace was deposited
+                    # in the *previous* cycle. Without this gate,
+                    # all_draft_trace would contain both rounds' deposits
+                    # concatenated, and round k's records would be shifted
+                    # by γ.
+                    all_draft_trace = trace_state.pop_draft_trace(
+                        req_id, n=num_draft_tokens)
                     all_target_trace = trace_state.pop_target_trace(req_id)
 
                     # Target logprobs: one per output token (accepted + bonus)
@@ -1548,9 +1573,47 @@ class Scheduler(SchedulerInterface):
                     d_lp_list.append(correction_lp)
 
                     # Build per-token trace records for this round.
+                    #
+                    # Slot-type semantics (Mod B retains rolled-back slots):
+                    #   * Reject round: iterate `num_draft_tokens` slots.
+                    #     Slots [0, num_accepted)        -> accepted draft
+                    #     Slot   num_accepted            -> rejection slot
+                    #     Slots (num_accepted, gamma)    -> rolled-back
+                    #     The output `generated_token_ids` only contains
+                    #     `num_accepted + 1` tokens (accepts + recovered),
+                    #     so for rolled-back slots we read the original
+                    #     draft proposal from `scheduled_spec_token_ids`
+                    #     (which is the full gamma-length proposal list).
+                    #   * Full-accept round: iterate `num_draft_tokens + 1`
+                    #     slots = `len(generated_token_ids)`. The +1 is
+                    #     the bonus slot whose target fields are filled by
+                    #     Mod C; bonus draft top-10 is read from the next
+                    #     round's first draft step (which conditions on
+                    #     the same prefix), giving it draft fields via
+                    #     `all_draft_trace[gamma]` when present.
                     all_accepted = (num_accepted >= num_draft_tokens)
-                    for i in range(len(generated_token_ids)):
-                        token_id = generated_token_ids[i]
+                    if all_accepted:
+                        # gamma accepts + 1 bonus
+                        n_slots = len(generated_token_ids)
+                    else:
+                        # gamma slots: num_accepted accepts + 1 rejection
+                        # + (gamma - num_accepted - 1) rolled-back
+                        n_slots = num_draft_tokens
+                    for i in range(n_slots):
+                        # token_id: for accepts and the rejection slot it
+                        # comes from `generated_token_ids` (the actual
+                        # committed/recovered output). For rolled-back
+                        # slots it comes from `scheduled_spec_token_ids`
+                        # (the draft's preempted proposal). For the bonus
+                        # slot (full-accept only) it comes from
+                        # `generated_token_ids` (the target-sampled
+                        # bonus token).
+                        is_rolled_back = (
+                            (not all_accepted) and i > num_accepted)
+                        if is_rolled_back:
+                            token_id = scheduled_spec_token_ids[i]
+                        else:
+                            token_id = generated_token_ids[i]
                         is_accepted = (i < num_accepted) or (
                             i == num_accepted and all_accepted)
                         # is_rejection_position: the first rejected token
@@ -1558,14 +1621,57 @@ class Scheduler(SchedulerInterface):
                             i == num_accepted and not all_accepted)
                         pos_in_round = i
 
+                        # Mod I: draft_proposed_token_id is the draft
+                        # model's proposal at this slot — *regardless* of
+                        # whether the proposal was accepted, rejected, or
+                        # rolled back. Source: scheduled_spec_token_ids[i]
+                        # for the γ verify slots. Null at the bonus slot
+                        # (i == γ) because the draft never proposed at
+                        # that position in this round (spec-decode emits γ
+                        # proposals; the bonus is the target's free
+                        # continuation at slot γ).
+                        if i < num_draft_tokens:
+                            draft_proposed_token_id = (
+                                scheduled_spec_token_ids[i])
+                        else:
+                            # i == num_draft_tokens (== γ), only reached
+                            # in full-accept rounds where n_slots = γ + 1
+                            # and the bonus slot is i == γ.
+                            draft_proposed_token_id = None
+
                         rec: dict = {
-                            "position": pos_counter,
+                            # Mod H: position is pos_counter + i (the slot's
+                            # offset into this round). For the worked example,
+                            # this gives round 0 slots positions 1..5 (with
+                            # rolled-back at 4, 5) and round 1 slots positions
+                            # 4..9 — the rolled-back positions correctly
+                            # overlap with the next round's accepts. After the
+                            # loop we advance pos_counter by the COMMITTED
+                            # count (num_accepted + 1 for reject rounds;
+                            # n_slots for full-accept rounds), NOT by n_slots.
+                            "position": pos_counter + i,
                             "token_id": token_id,
                             "token_str": None,
                             "accepted": is_accepted,
                             "is_rejection_position": is_rejection,
+                            "was_rolled_back": is_rolled_back,
+                            # Mod E: explicit bonus-slot flag. Set to the
+                            # actual bonus boolean below when we read the
+                            # target-side trace dict (which carries the
+                            # internal `is_bonus_slot` marker added by Mod
+                            # C). Defaults to False here so accept,
+                            # rejection, rolled-back, and any branch that
+                            # falls through without consulting the target
+                            # buffer all emit False — only the genuine
+                            # bonus slot at position_in_round == gamma in
+                            # full-accept rounds gets flipped to True.
+                            "is_bonus_slot": False,
                             "speculative_round": round_counter,
                             "position_in_round": pos_in_round,
+                            # Mod I: draft's argmax/proposal at this slot,
+                            # null at the bonus slot (no proposal exists).
+                            "draft_proposed_token_id":
+                                draft_proposed_token_id,
                         }
 
                         # Draft-side trace data.
@@ -1593,46 +1699,114 @@ class Scheduler(SchedulerInterface):
                             rec["draft_top5_prob"] = None
 
                         # Target-side trace data.
+                        # Mod A: target_logits_top10 / target_softmax_top10
+                        # are the symmetric counterpart to draft_*_top10
+                        # and are populated by the rejection sampler from
+                        # the parallel target forward-pass output. Mod D
+                        # uses both top-10 dicts to compute KL on the
+                        # union of ids with epsilon-smoothing.
+                        # Mod B: rolled-back slots reuse the same target
+                        # buffer entry — the parallel target forward
+                        # already computed top-10 at all gamma draft
+                        # positions, so `all_target_trace[i]` is valid
+                        # for every i in [0, gamma) regardless of whether
+                        # slot i was committed, rejected, or rolled back.
+                        # Mod C: the rejection sampler appends a bonus
+                        # dict at index gamma per request, so for
+                        # full-accept rounds `all_target_trace[gamma]`
+                        # holds the bonus slot's target top-10 / top-1
+                        # extracted from `bonus_logits` (the same
+                        # parallel forward pass that produced the bonus
+                        # token). The bonus dict is flagged
+                        # `is_bonus_slot=True` and has
+                        # target_prob_of_draft_token=None (no draft
+                        # proposal scored at the bonus slot).
                         if draft_idx < len(all_target_trace):
                             tt = all_target_trace[draft_idx]
-                            rec["target_prob_of_draft_token"] = tt[
-                                "target_prob_of_draft_token"]
+                            is_bonus = tt.get("is_bonus_slot", False)
+                            # Mod E: surface the internal Mod-C marker on
+                            # the emitted record. The cross-check invariant
+                            # is is_bonus_slot == (accepted and not
+                            # is_rejection_position and not was_rolled_back
+                            # and position_in_round == gamma and
+                            # position > 0).
+                            rec["is_bonus_slot"] = is_bonus
+                            # Defense-in-depth (Finding 4 tidy-up): even
+                            # if the upstream dict had a non-null
+                            # target_prob_of_draft_token, force it to
+                            # None on the bonus slot.
+                            rec["target_prob_of_draft_token"] = (
+                                None if is_bonus else
+                                tt["target_prob_of_draft_token"])
                             rec["target_top1_token_id"] = tt[
                                 "target_top1_token_id"]
                             rec["target_top1_prob"] = tt[
                                 "target_top1_prob"]
+                            rec["target_logits_top10"] = tt.get(
+                                "target_top10_logits")
+                            rec["target_softmax_top10"] = tt.get(
+                                "target_top10_softmax")
                             kl_val = tt["kl_divergence"]
-                            # If KL was not computed in the rejection
-                            # sampler (e.g., EAGLE passes draft_probs=
-                            # None), approximate KL from draft softmax
-                            # top-10 and target logprobs.
+                            # Mod D: if KL was not computed in the
+                            # rejection sampler (e.g., EAGLE / greedy
+                            # paths pass draft_probs=None), compute
+                            # KL(draft || target) on the union of
+                            # draft top-10 and target top-10 ids with
+                            # epsilon smoothing. Both top-10 dicts are
+                            # populated by Mods A + C at every
+                            # non-bootstrap slot, so this branch
+                            # populates kl_divergence for ~100% of
+                            # slots after the gate is closed (was 0%
+                            # before Mod D).
                             if (kl_val is None
                                     and rec["draft_softmax_top10"]
                                     is not None
-                                    and sliced is not None
-                                    and i < sliced.logprob_token_ids
-                                    .shape[0]):
+                                    and rec["target_softmax_top10"]
+                                    is not None):
                                 kl_val = self._approx_kl_from_topk(
                                     rec["draft_softmax_top10"],
-                                    sliced, i)
+                                    rec["target_softmax_top10"])
                             rec["kl_divergence"] = kl_val
                         elif (sliced is not None
                               and i < sliced.logprob_token_ids.shape[0]):
-                            # Fallback: extract from target logprobs.
+                            # Legacy fallback: extract from target
+                            # logprobs. Reached only if the bonus dict
+                            # is unavailable (e.g., the rejection
+                            # sampler was bypassed) — under normal Mod
+                            # C operation this branch is dead at the
+                            # bonus slot.
                             rec["target_top1_token_id"] = int(
                                 sliced.logprob_token_ids[i, 0])
                             rec["target_top1_prob"] = float(
                                 pow(2.718281828, sliced.logprobs[i, 0]))
                             rec["target_prob_of_draft_token"] = None
+                            rec["target_logits_top10"] = None
+                            rec["target_softmax_top10"] = None
                             rec["kl_divergence"] = None
                         else:
                             rec["target_prob_of_draft_token"] = None
                             rec["target_top1_token_id"] = None
                             rec["target_top1_prob"] = None
+                            rec["target_logits_top10"] = None
+                            rec["target_softmax_top10"] = None
                             rec["kl_divergence"] = None
 
                         records.append(rec)
-                        pos_counter += 1
+                        # Mod H: removed `pos_counter += 1` from per-slot
+                        # increment. Position counter now advances by the
+                        # round's committed count, computed below.
+
+                    # Mod H: advance pos_counter by committed count only.
+                    # Full-accept rounds commit n_slots tokens (γ accepts
+                    # + 1 bonus). Reject rounds commit num_accepted + 1
+                    # tokens (k accepts + 1 rejection); the remaining
+                    # γ - num_accepted - 1 rolled-back slots do NOT
+                    # advance the committed-stream position.
+                    if all_accepted:
+                        committed_in_round = n_slots
+                    else:
+                        committed_in_round = num_accepted + 1
+                    pos_counter += committed_in_round
 
                     round_counter += 1
                     self._spec_decode_position_counter[req_id] = (
@@ -1666,8 +1840,18 @@ class Scheduler(SchedulerInterface):
                             "token_str": None,
                             "accepted": True,
                             "is_rejection_position": False,
+                            "was_rolled_back": False,
+                            # Mod E: prefill / AR-decode tokens (including
+                            # the position-0 bootstrap) are never bonus
+                            # slots. Bonus slots only exist at
+                            # position_in_round == gamma in full-accept
+                            # speculative rounds.
+                            "is_bonus_slot": False,
                             "speculative_round": None,
                             "position_in_round": None,
+                            # Mod I: non-spec path has no draft proposal
+                            # (bootstrap / AR-decode / prefill).
+                            "draft_proposed_token_id": None,
                             "draft_logits_top10": None,
                             "draft_softmax_top10": None,
                             "draft_entropy": None,
@@ -1676,6 +1860,8 @@ class Scheduler(SchedulerInterface):
                             "target_prob_of_draft_token": None,
                             "target_top1_token_id": None,
                             "target_top1_prob": None,
+                            "target_logits_top10": None,
+                            "target_softmax_top10": None,
                             "kl_divergence": None,
                         }
                         records.append(rec)
@@ -2120,11 +2306,41 @@ class Scheduler(SchedulerInterface):
             mask = self._spec_decode_trace.pop(req_id, None)
             records = self._spec_decode_trace_records.pop(req_id, None)
             if mask is not None:
-                # Compute summary statistics.
-                total_accepted = sum(1 for b in mask if b)
-                total_rejected = len(mask) - total_accepted
+                # Mod H follow-up: compute envelope counters from `records`,
+                # the structured per-slot trace, instead of from `mask`.
+                # `mask` includes a True for the position-0 bootstrap (added
+                # via the non-speculative branch's `trace.extend([True] *
+                # len(generated_token_ids))`), which inflated `total_accepted`
+                # and `len(mask)` by 1. The committed generated-token stream
+                # is exactly the records that are NOT the bootstrap and NOT
+                # rolled-back; per `experiment_plan_slurm/step1_traces.md:263`
+                # `generated_token_count == total_accepted + total_rejected`,
+                # and `acceptance_rate = total_accepted / generated_token_count`.
+                _records = records or []
+
+                def _is_bootstrap_record(r: dict) -> bool:
+                    return (
+                        r.get("position") == 0
+                        and r.get("speculative_round") is None
+                        and not r.get("was_rolled_back", False)
+                        and not r.get("is_rejection_position", False)
+                    )
+
+                committed_records = [
+                    r for r in _records
+                    if not _is_bootstrap_record(r)
+                    and not r.get("was_rolled_back", False)
+                ]
+                generated_token_count = len(committed_records)
+                total_accepted = sum(
+                    1 for r in committed_records
+                    if r.get("accepted") is True)
+                total_rejected = sum(
+                    1 for r in committed_records
+                    if r.get("is_rejection_position") is True)
                 acceptance_rate = (
-                    total_accepted / len(mask) if mask else 0.0)
+                    total_accepted / generated_token_count
+                    if generated_token_count else 0.0)
                 num_rounds = self._spec_decode_round_counter.get(
                     req_id, 0)
                 start_t = self._spec_decode_start_time.get(req_id)
@@ -2167,8 +2383,7 @@ class Scheduler(SchedulerInterface):
                     "temperature": temperature,
                     "top_p": top_p,
                     "prompt_token_count": request.num_prompt_tokens,
-                    "generated_token_count": len(records) if records
-                                             else len(mask),
+                    "generated_token_count": generated_token_count,
                     "total_accepted": total_accepted,
                     "total_rejected": total_rejected,
                     "acceptance_rate": round(acceptance_rate, 4),

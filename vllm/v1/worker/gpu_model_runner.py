@@ -3343,6 +3343,12 @@ class GPUModelRunner(
             num_reqs = self.input_batch.num_reqs
             req_ids = self.input_batch.req_ids
             for req_idx in range(min(num_reqs, len(target_trace))):
+                # Mod F: skip deposit for requests with no draft tokens this
+                # step. The rejection sampler's gate above already drops the
+                # leaked bonus dict, but mirroring the check here is
+                # belt-and-suspenders against future regressions.
+                if spec_decode_metadata.num_draft_tokens[req_idx] == 0:
+                    continue
                 req_id = req_ids[req_idx]
                 for pos_data in target_trace[req_idx]:
                     trace_state.add_target_trace(req_id, pos_data)
