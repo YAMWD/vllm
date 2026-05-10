@@ -1621,6 +1621,24 @@ class Scheduler(SchedulerInterface):
                             i == num_accepted and not all_accepted)
                         pos_in_round = i
 
+                        # Mod I: draft_proposed_token_id is the draft
+                        # model's proposal at this slot — *regardless* of
+                        # whether the proposal was accepted, rejected, or
+                        # rolled back. Source: scheduled_spec_token_ids[i]
+                        # for the γ verify slots. Null at the bonus slot
+                        # (i == γ) because the draft never proposed at
+                        # that position in this round (spec-decode emits γ
+                        # proposals; the bonus is the target's free
+                        # continuation at slot γ).
+                        if i < num_draft_tokens:
+                            draft_proposed_token_id = (
+                                scheduled_spec_token_ids[i])
+                        else:
+                            # i == num_draft_tokens (== γ), only reached
+                            # in full-accept rounds where n_slots = γ + 1
+                            # and the bonus slot is i == γ.
+                            draft_proposed_token_id = None
+
                         rec: dict = {
                             # Mod H: position is pos_counter + i (the slot's
                             # offset into this round). For the worked example,
@@ -1650,6 +1668,10 @@ class Scheduler(SchedulerInterface):
                             "is_bonus_slot": False,
                             "speculative_round": round_counter,
                             "position_in_round": pos_in_round,
+                            # Mod I: draft's argmax/proposal at this slot,
+                            # null at the bonus slot (no proposal exists).
+                            "draft_proposed_token_id":
+                                draft_proposed_token_id,
                         }
 
                         # Draft-side trace data.
@@ -1827,6 +1849,9 @@ class Scheduler(SchedulerInterface):
                             "is_bonus_slot": False,
                             "speculative_round": None,
                             "position_in_round": None,
+                            # Mod I: non-spec path has no draft proposal
+                            # (bootstrap / AR-decode / prefill).
+                            "draft_proposed_token_id": None,
                             "draft_logits_top10": None,
                             "draft_softmax_top10": None,
                             "draft_entropy": None,
